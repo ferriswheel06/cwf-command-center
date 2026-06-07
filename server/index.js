@@ -593,6 +593,278 @@ app.get('/api/customers/:id', auth, async (c) => {
 })
 
 
+// ============================================================================
+// WAVE 4 — "Compound": schedule future energy, collapse the won workflow,
+// chase the review every time, build the proof wall, reuse every asset,
+// and pour energy into the content that actually pulls leads.
+// All tenant-scoped via biz(c). Flat price, no tax, $1k profit floor honored.
+// ============================================================================
+
+// ---- RE-CONTACT ENGINE — schedule future energy now (tasks kind='recontact') ----
+// Time-released reminders tied to a job/customer: "that Volvo belt was borderline — check in at 6 months".
+app.get('/api/recontact', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select t.id, t.title, t.body, t.kind, t.status, t.due_at, t.created_at,
+      t.job_id, t.customer_id,
+      c.name as customer, c.phone, c.location,
+      j.status as job_status, j.issue, j.ticket_tier,
+      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle,
+      case when t.due_at is not null then floor(extract(epoch from (now()-t.due_at))/86400.0)::int else null end as overdue_days
+    from tasks t
+    left join customers c on c.id=t.customer_id
+    left join jobs j on j.id=t.job_id
+    left join vehicles v on v.id=j.vehicle_id
+    where t.business_id=$1 and t.kind='recontact' and t.status='open'
+    order by t.due_at asc nulls last, t.created_at asc`, [b])).rows
+  const due = rows.filter((r) => r.due_at == null || new Date(r.due_at) <= new Date())
+  const upcoming = rows.filter((r) => r.due_at != null && new Date(r.due_at) > new Date())
+  return c.json({ due, upcoming, count: { due: due.length, upcoming: upcoming.length } })
+})
+app.post('/api/recontact', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const title = (d.title || '').toString().trim()
+  if (!title) return c.json({ error: 'need a reminder title' }, 400)
+  const jobId = d.job_id ? Number(d.job_id) : null
+  let custId = d.customer_id ? Number(d.customer_id) : null
+  // tenant-scope + backfill the customer from the job if only a job was given
+  if (jobId) {
+    const job = (await q(`select customer_id from jobs where id=$1 and business_id=$2`, [jobId, b])).rows[0]
+    if (!job) return c.json({ error: 'job not found' }, 404)
+    if (!custId) custId = job.customer_id
+  }
+  if (custId) {
+    const cust = (await q(`select id from customers where id=$1 and business_id=$2`, [custId, b])).rows[0]
+    if (!cust) return c.json({ error: 'customer not found' }, 404)
+  }
+  const row = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status,due_at)
+      values ($1,$2,$3,'recontact',$4,$5,'open',$6::timestamptz)
+      returning id, title, body, kind, status, due_at, created_at, job_id, customer_id`,
+    [b, jobId, custId, title, d.body || null, d.due_at || null])).rows[0]
+  if (jobId) await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'system',$4)`,
+    [b, jobId, custId, `Re-contact scheduled: ${title}`])
+  return c.json({ recontact: row })
+})
+app.post('/api/recontact/:id/done', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const row = (await q(`select id, job_id, customer_id, title from tasks
+      where id=$1 and business_id=$2 and kind='recontact'`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  await q(`update tasks set status='done', completed_at=now() where id=$1 and business_id=$2`, [id, b])
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'system',$4)`,
+    [b, row.job_id || null, row.customer_id || null, `Re-contact done: ${row.title}`])
+  return c.json({ ok: true })
+})
+
+// ---- ONE-TAP WON — winning a job collapses the overhead into one button ----
+// status=scheduled + quote_status=accepted, auto-create review-ask + photo-capture reminder, log it.
+app.post('/api/jobs/:id/won', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const job = (await q(`select j.id, j.customer_id, j.charge, j.parts_cost, j.gas_cost, j.scheduled_date,
+      c.name as customer, nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id
+    where j.id=$1 and j.business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  const profit = (Number(job.charge) || 0) - (Number(job.parts_cost) || 0) - (Number(job.gas_cost) || 0)
+  await q(`update jobs set status='scheduled', quote_status='accepted' where id=$1 and business_id=$2`, [id, b])
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'status_change',$4)`,
+    [b, id, job.customer_id, `Marked WON → scheduled ✓ (flat $${Number(job.charge) || 0} · profit $${profit})`])
+  const who = job.customer || 'the customer'
+  const ride = job.vehicle ? ` on the ${job.vehicle}` : ''
+  const checklist = []
+  // 1) review-ask task — ask every happy customer, every time
+  const reviewTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status)
+      values ($1,$2,$3,'review_ask',$4,$5,'open')
+      returning id, title`,
+    [b, id, job.customer_id, `Ask ${who} for a Google review`,
+      `After the job${ride} is done — send the review-ask text. Each review makes the next stranger trust you faster.`])).rows[0]
+  checklist.push({ kind: 'review_ask', task_id: reviewTask.id, title: reviewTask.title, when: 'after the job' })
+  // 2) photo-capture reminder — recontact due after the job (default 1 day out, or scheduled_date if known)
+  const photoDue = job.scheduled_date
+    ? `(date '${new Date(job.scheduled_date).toISOString().slice(0, 10)}' + 1)::timestamptz`
+    : `(current_date + 1)::timestamptz`
+  const photoTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status,due_at)
+      values ($1,$2,$3,'recontact',$4,$5,'open',${photoDue})
+      returning id, title, due_at`,
+    [b, id, job.customer_id, `Grab before/after photos${ride}`,
+      `Capture the job photos/clips — they become content and the proof you drop to close the next hesitant prospect.`])).rows[0]
+  checklist.push({ kind: 'recontact', task_id: photoTask.id, title: photoTask.title, when: 'after the job', due_at: photoTask.due_at })
+  return c.json({
+    ok: true, status: 'scheduled', quote_status: 'accepted',
+    charge: Number(job.charge) || 0, profit, below_floor: profit < 1000,
+    checklist,
+  })
+})
+
+// ---- REVIEW ASK + GOT TRACKING — ask every happy customer, track ask-rate + got-rate ----
+// eligible = completed|paid. ask-rate = asked/eligible. got-rate = received/asked.
+app.get('/api/reviews', auth, async (c) => {
+  const b = biz(c)
+  const m = (await q(`select
+      count(*) filter (where status in ('completed','paid'))::int as eligible,
+      count(*) filter (where status in ('completed','paid') and review_ask_sent_at is not null)::int as asked,
+      count(*) filter (where status in ('completed','paid') and review_received_at is not null)::int as received
+    from jobs where business_id=$1`, [b])).rows[0]
+  const askRate = m.eligible ? Math.round((m.asked / m.eligible) * 100) : 0
+  const gotRate = m.asked ? Math.round((m.received / m.asked) * 100) : 0
+  // eligible but never asked — the ones leaking trust
+  const notAsked = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status in ('completed','paid') and j.review_ask_sent_at is null
+      order by j.paid_at desc nulls last, j.created_at desc`, [b])).rows
+  // asked but not yet got — the ones to nudge
+  const notGot = (await q(`select ${JOB_COLS}, j.review_ask_sent_at,
+      floor(extract(epoch from (now()-j.review_ask_sent_at))/86400.0)::int as asked_days_ago
+    ${JOB_FROM}
+      where j.business_id=$1 and j.status in ('completed','paid')
+        and j.review_ask_sent_at is not null and j.review_received_at is null
+      order by j.review_ask_sent_at asc`, [b])).rows
+  return c.json({
+    summary: { eligible: m.eligible, asked: m.asked, received: m.received, ask_rate: askRate, got_rate: gotRate },
+    not_asked: notAsked, not_got: notGot,
+  })
+})
+app.post('/api/jobs/:id/review-asked', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const job = (await q(`select id, customer_id from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  await q(`update jobs set review_ask_sent_at=coalesce(review_ask_sent_at,now()) where id=$1 and business_id=$2`, [id, b])
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'review','Review ask sent')`,
+    [b, id, job.customer_id])
+  return c.json({ ok: true })
+})
+app.post('/api/jobs/:id/review-got', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const job = (await q(`select id, customer_id from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  // stamp asked too if it somehow skipped — a got review was obviously asked for
+  await q(`update jobs set review_received_at=coalesce(review_received_at,now()),
+      review_ask_sent_at=coalesce(review_ask_sent_at,now()) where id=$1 and business_id=$2`, [id, b])
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'review','Review received ✓')`,
+    [b, id, job.customer_id])
+  return c.json({ ok: true })
+})
+
+// ---- PROOF WALL — compile reviews/testimonials/results to drop into a closing DM ----
+// kind: review | testimonial | result | before_after
+const PROOF_KINDS = ['review', 'testimonial', 'result', 'before_after']
+app.get('/api/proof', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select p.id, p.kind, p.author, p.text, p.stars, p.job_id, p.created_at,
+      c.name as customer
+    from proof p
+    left join jobs j on j.id=p.job_id and j.business_id=p.business_id
+    left join customers c on c.id=j.customer_id
+    where p.business_id=$1 order by p.created_at desc`, [b])).rows
+  return c.json({ proof: rows, count: rows.length })
+})
+app.post('/api/proof', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const text = (d.text || '').toString().trim()
+  if (!text) return c.json({ error: 'paste the proof text' }, 400)
+  const kind = PROOF_KINDS.includes(d.kind) ? d.kind : 'review'
+  const author = (d.author || '').toString().trim() || null
+  let stars = d.stars != null ? Number(d.stars) : null
+  if (stars != null) stars = Math.max(0, Math.min(5, Math.round(stars)))
+  let jobId = d.job_id ? Number(d.job_id) : null
+  if (jobId) {
+    const job = (await q(`select id from jobs where id=$1 and business_id=$2`, [jobId, b])).rows[0]
+    if (!job) return c.json({ error: 'job not found' }, 404)
+  }
+  const row = (await q(`insert into proof (business_id,kind,author,text,stars,job_id)
+      values ($1,$2,$3,$4,$5,$6) returning id, kind, author, text, stars, job_id, created_at`,
+    [b, kind, author, text, stars, jobId])).rows[0]
+  return c.json({ proof: row })
+})
+app.delete('/api/proof/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const r = await q(`delete from proof where id=$1 and business_id=$2`, [id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+
+// ---- ASSET LIBRARY — every job's photos/clips, reusable for content + closing ----
+// All assets across jobs with job + customer context. Filter: ?kind= &is_before=
+app.get('/api/assets', auth, async (c) => {
+  const b = biz(c)
+  const kind = (c.req.query('kind') || '').toString().trim()
+  const isBefore = c.req.query('is_before')
+  const params = [b]
+  let where = `a.business_id=$1`
+  if (kind && ASSET_KINDS.includes(kind)) { params.push(kind); where += ` and a.kind=$${params.length}` }
+  if (isBefore === 'true' || isBefore === 'false') { params.push(isBefore === 'true'); where += ` and a.is_before=$${params.length}` }
+  const rows = (await q(`select a.id, a.kind, a.url, a.label, a.is_before, a.created_at,
+      a.job_id, a.customer_id,
+      c.name as customer,
+      j.status as job_status, j.issue, j.service, j.ticket_tier,
+      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from assets a
+    left join jobs j on j.id=a.job_id and j.business_id=a.business_id
+    left join customers c on c.id=a.customer_id and c.business_id=a.business_id
+    left join vehicles v on v.id=j.vehicle_id
+    where ${where}
+    order by a.created_at desc`, params)).rows
+  const counts = (await q(`select kind, count(*)::int n from assets where business_id=$1 group by kind`, [b])).rows
+  const by_kind = {}
+  for (const r of counts) by_kind[r.kind] = r.n
+  return c.json({ assets: rows, total: rows.length, by_kind })
+})
+
+// ---- CONTENT → LEAD ATTRIBUTION — rank content by leads produced, not likes ----
+const CONTENT_STATUSES = ['idea', 'draft', 'scheduled', 'posted']
+app.get('/api/content', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select id, title, channel, status, url, notes,
+      coalesce(leads_attributed,0)::int as leads_attributed,
+      posted_at, created_at
+    from content where business_id=$1
+    order by coalesce(leads_attributed,0) desc, coalesce(posted_at,created_at) desc`, [b])).rows
+  const summary = {
+    pieces: rows.length,
+    posted: rows.filter((r) => r.status === 'posted').length,
+    total_leads: rows.reduce((s, r) => s + (Number(r.leads_attributed) || 0), 0),
+  }
+  // what's actually pulling — content with at least one attributed lead, best first
+  const winners = rows.filter((r) => (Number(r.leads_attributed) || 0) > 0).slice(0, 10)
+  return c.json({ content: rows, summary, winners })
+})
+app.post('/api/content', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const title = (d.title || '').toString().trim()
+  if (!title) return c.json({ error: 'need a title' }, 400)
+  const status = CONTENT_STATUSES.includes(d.status) ? d.status : 'posted'
+  const channel = (d.channel || '').toString().trim() || null
+  const url = (d.url || '').toString().trim() || null
+  const notes = (d.notes || '').toString().trim() || null
+  // posted_at: explicit, or now() if it's already posted, else null
+  const postedAt = d.posted_at || (status === 'posted' ? new Date().toISOString() : null)
+  const leads = d.leads_attributed != null ? Math.max(0, Number(d.leads_attributed) || 0) : 0
+  const row = (await q(`insert into content (business_id,title,channel,status,url,notes,posted_at,leads_attributed)
+      values ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8)
+      returning id, title, channel, status, url, notes, leads_attributed, posted_at, created_at`,
+    [b, title, channel, status, url, notes, postedAt, leads])).rows[0]
+  return c.json({ content: row })
+})
+// +1 a lead (delta), or set leads_attributed to an absolute number
+app.post('/api/content/:id/attribute', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const row = (await q(`select id, title, coalesce(leads_attributed,0)::int as leads_attributed
+      from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  let next
+  if (d.set != null) next = Math.max(0, Number(d.set) || 0)
+  else next = Math.max(0, row.leads_attributed + (d.delta != null ? Number(d.delta) || 0 : 1))
+  await q(`update content set leads_attributed=$1 where id=$2 and business_id=$3`, [next, id, b])
+  await q(`insert into activity (business_id,type,body) values ($1,'system',$2)`,
+    [b, `Content lead attributed: "${row.title}" → ${next} lead${next === 1 ? '' : 's'}`])
+  return c.json({ ok: true, leads_attributed: next })
+})
+app.post('/api/content/:id/delete', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const r = await q(`delete from content where id=$1 and business_id=$2`, [id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()

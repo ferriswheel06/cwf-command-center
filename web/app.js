@@ -29,11 +29,11 @@ const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: '
 const NAV_GROUPS = [
   ['Acquire', [['pulse', 'Pulse', I.spark], ['triage', 'Triage', I.bolt]]],
   ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['quotes', 'Quotes', I.money], ['customers', 'Customers', I.today], ['money', 'Money', I.money]]],
-  ['Grow', [['activation', 'Activation', I.bolt]]],
-  ['Plan', [['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
+  ['Grow', [['activation', 'Activation', I.bolt], ['proof', 'Proof', I.check], ['content', 'Content', I.spark]]],
+  ['Plan', [['assets', 'Library', I.today], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', quotes: 'Quotes', customers: 'Customers', money: 'Money', activation: 'Activation', templates: 'Templates', backburner: 'Back-burner' }
+const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', quotes: 'Quotes', customers: 'Customers', money: 'Money', activation: 'Activation', proof: 'Proof', content: 'Content', assets: 'Asset library', templates: 'Templates', backburner: 'Back-burner' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -80,6 +80,9 @@ async function renderApp(next) {
 else if (tab === 'triage') await viewTriage()
 else if (tab === 'customers') await viewCustomers()
 else if (tab === 'templates') await viewTemplates()
+else if (tab === 'proof') await viewProof()
+else if (tab === 'content') await viewContent()
+else if (tab === 'assets') await viewAssets()
   } catch (e) { /* 401 handled */ }
 }
 
@@ -316,7 +319,9 @@ async function openJob(id) {
         ${j.phone ? `<a class="btn ghost sm" href="tel:${esc(j.phone)}">${I.phone} Call</a>` : ''}
         ${j.status !== 'paid' && j.status !== 'lost' ? `<button class="btn ghost sm" id="dadv">${I.arrow} Advance</button>` : ''}
         <button class="btn ghost sm" id="dreply">Quick reply</button>
-        <button class="btn primary sm" id="dquote">Quote</button></div>
+        <button class="btn ghost sm" id="drecontact">${I.plus} Check-in</button>
+        ${j.status === 'lead' || j.status === 'quoted' ? `<button class="btn primary sm" id="dwon">${I.check} Mark won</button>` : ''}
+        <button class="btn ghost sm" id="dquote">Quote</button></div>
       <div><div class="label" style="margin-bottom:var(--s2)">Files &amp; photos</div><div class="asset-host">Loading…</div></div>
       <div><div class="label" style="margin-bottom:var(--s2)">Activity</div>
         <div class="tl">${(d.activity || []).map((a) => `<div class="tl__i"><span class="dot"></span><div><div class="body">${esc(a.body || a.type)}</div><div class="when">${ago(a.created_at)} ago</div></div></div>`).join('') || '<span style="color:var(--fg4);font-size:12px">No activity yet</span>'}</div></div>
@@ -327,6 +332,12 @@ async function openJob(id) {
   const adv = $('#dadv', wrap); if (adv) adv.onclick = async () => { await api(`/api/jobs/${id}/advance`, { method: 'POST' }); close(); renderApp() }
   $('#dquote', wrap).onclick = () => { close(); openQuote(j) }
   const dr = $('#dreply', wrap); if (dr) dr.onclick = () => openQuickReply(j)
+  const rc = $('#drecontact', wrap); if (rc) rc.onclick = () => openRecontact(j)
+  const won = $('#dwon', wrap); if (won) won.onclick = async () => {
+    won.disabled = true
+    const res = await api(`/api/jobs/${id}/won`, { method: 'POST' })
+    close(); showWonChecklist(res, j.customer); renderApp()
+  }
   const ah = $('.asset-host', wrap); if (ah) loadAssets(id, ah)
 }
 
@@ -883,6 +894,350 @@ function custJobRow(j) {
     <span class="pill ${j.status}"><span class="dot"></span>${esc((j.status || '').replace('_', ' '))}</span>
     <span class="amt">${val ? money(val) : ''}</span>
   </div>`
+}
+
+/* ===================== WAVE 4 · COMPOUND ===================== */
+
+/* --- star rendering (proof + reviews) --- */
+function stars(n) {
+  const s = Math.max(0, Math.min(5, Math.round(Number(n || 0))))
+  if (!s) return ''
+  return `<span class="stars">${'★'.repeat(s)}<span class="stars__off">${'★'.repeat(5 - s)}</span></span>`
+}
+const PROOF_KIND = { review: 'Review', testimonial: 'Testimonial', result: 'Result', before_after: 'Before / after' }
+const PROOF_KINDS = [['review', 'Review'], ['testimonial', 'Testimonial'], ['result', 'Result'], ['before_after', 'Before / after']]
+
+/* --- build the copy-block for a single proof card (text + author, no chrome) --- */
+function proofToText(p) {
+  const head = (p.stars ? '★'.repeat(Math.min(5, Math.round(p.stars))) + '  ' : '')
+  const who = p.author ? ` — ${p.author}` : ''
+  return `${head}"${String(p.text || '').trim()}"${who}`
+}
+
+/* ===================== PROOF (wall + review ask/got) ===================== */
+async function viewProof() {
+  const [pd, rd] = await Promise.all([api('/api/proof'), api('/api/reviews')])
+  const proof = pd.proof || []
+  const r = rd.summary || {}, notAsked = rd.not_asked || [], notGot = rd.not_got || []
+  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn ghost sm" id="proof-copyall">${I.check} Copy all</button><button class="btn primary sm" id="proof-add">${I.plus} Add proof</button>` }
+  const askRate = Math.round(Number(r.ask_rate || 0)), gotRate = Math.round(Number(r.got_rate || 0))
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} The close-the-deal stack</span>
+      <p>Ask every happy customer, every time — then keep the proof in one place. When a prospect's on the fence, drop the wall into the DM. Trust closes the job, not a discount.</p></div>
+    <div class="kpis">
+      <div class="kpi"><div class="lab">Eligible</div><div class="val">${r.eligible || 0}</div><div class="meta">completed + paid</div></div>
+      <div class="kpi ${askRate < 80 && r.eligible ? 'warn' : ''}"><div class="lab">Ask rate</div><div class="val">${askRate}%</div><div class="meta">${r.asked || 0} asked</div></div>
+      <div class="kpi"><div class="lab">Got rate</div><div class="val">${gotRate}%</div><div class="meta">${r.received || 0} landed</div></div>
+      <div class="kpi primary"><div class="lab">On the wall</div><div class="val">${proof.length}</div><div class="meta">ready to send</div></div>
+    </div>
+
+    ${notAsked.length ? `<div class="sec-h"><span class="label">Ask these now — happy + not asked</span><span class="ct">${notAsked.length}</span></div>
+      <div class="list">${notAsked.map(reviewRow.bind(null, 'ask')).join('')}</div>` : ''}
+    ${notGot.length ? `<div class="sec-h"><span class="label">Asked, still waiting — nudge or mark it landed</span><span class="ct">${notGot.length}</span></div>
+      <div class="list">${notGot.map(reviewRow.bind(null, 'got')).join('')}</div>` : ''}
+
+    <div class="sec-h"><span class="label">Proof wall</span><span class="ct">${proof.length}</span></div>
+    ${proof.length
+      ? `<div class="proof-grid">${proof.map(proofCard).join('')}</div>`
+      : emptyState('Wall is empty', 'Drop in your first review, a text a customer sent, a "shop quoted $X, you did $Y" win. This becomes the thing you paste to close the next hesitant one.')}
+  `)
+  app.querySelectorAll('.rrow .grow[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  app.querySelectorAll('[data-rev-asked]').forEach((b) => (b.onclick = async (e) => { e.stopPropagation(); await api(`/api/jobs/${b.dataset.revAsked}/review-asked`, { method: 'POST' }); renderApp('proof') }))
+  app.querySelectorAll('[data-rev-got]').forEach((b) => (b.onclick = async (e) => { e.stopPropagation(); await api(`/api/jobs/${b.dataset.revGot}/review-got`, { method: 'POST' }); renderApp('proof') }))
+  app.querySelectorAll('[data-proof-copy]').forEach((b) => (b.onclick = () => { const p = proof.find((x) => String(x.id) === b.dataset.proofCopy); copyText(p ? proofToText(p) : '', b) }))
+  app.querySelectorAll('[data-proof-del]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Remove this from the wall?')) return
+    await api(`/api/proof/${b.dataset.proofDel}`, { method: 'DELETE' }); renderApp('proof')
+  }))
+  const addBtn = $('#proof-add'); if (addBtn) addBtn.onclick = () => openProof()
+  const copyAll = $('#proof-copyall'); if (copyAll) copyAll.onclick = () => {
+    if (!proof.length) return
+    copyText(proof.map(proofToText).join('\n\n'), copyAll)
+  }
+}
+function reviewRow(mode, j) {
+  const days = j.asked_days_ago != null ? Math.round(j.asked_days_ago) : null
+  return `<div class="lrow rrow">
+    <div class="grow" data-job="${j.id}">
+      <div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+      <div class="sub">${esc([j.vehicle, j.issue || j.service].filter(Boolean).join(' · ') || 'No detail')}${mode === 'got' && days != null ? ` · asked ${days === 0 ? 'today' : days + 'd ago'}` : ''}</div>
+    </div>
+    <div class="qright">
+      <span class="amt">${j.charge || j.est_value ? money(j.charge || j.est_value) : ''}</span>
+      <div class="qacts">
+        ${mode === 'ask'
+          ? `<button class="btn primary sm" data-rev-asked="${j.id}">${I.check} Mark asked</button>`
+          : `<button class="btn primary sm" data-rev-got="${j.id}">${I.check} Got it</button><button class="btn ghost sm" data-rev-asked="${j.id}">Re-asked</button>`}
+      </div>
+    </div>
+  </div>`
+}
+function proofCard(p) {
+  return `<div class="proof-card" data-proof="${p.id}">
+    <div class="proof-card__h"><span class="proof-kind ${esc(p.kind || 'review')}">${esc(PROOF_KIND[p.kind] || 'Review')}</span>${stars(p.stars)}
+      <button class="proof-card__del" data-proof-del="${p.id}" title="Remove">${I.x}</button></div>
+    <div class="proof-card__text">${esc(p.text || '')}</div>
+    <div class="proof-card__foot">
+      <span class="proof-author">${esc(p.author || (p.customer || 'Anonymous'))}<span class="proof-when"> · ${ago(p.created_at)} ago</span></span>
+      <button class="btn ghost sm" data-proof-copy="${p.id}">${I.check} Copy</button>
+    </div>
+  </div>`
+}
+function openProof() {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Add proof</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Type</label>
+        <select class="input" id="pf-kind">${PROOF_KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Who said it</label><input class="input" id="pf-author" placeholder="e.g. Rob M. · Mississauga"></div>
+      <div class="field"><label>Stars (optional)</label>
+        <select class="input" id="pf-stars"><option value="0">— no rating —</option><option value="5">★★★★★</option><option value="4">★★★★</option><option value="3">★★★</option><option value="2">★★</option><option value="1">★</option></select></div>
+      <div class="field"><label>What they said / the result</label>
+        <textarea class="input ta" id="pf-text" rows="5" placeholder="Shop quoted him $2,400 for the timing chain — did it at his place for less and it's running mint."></textarea></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="pf-save">Add to wall</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#pf-save', wrap).onclick = async () => {
+    const text = $('#pf-text', wrap).value.trim(); if (!text) return
+    const body = { text, kind: $('#pf-kind', wrap).value, author: $('#pf-author', wrap).value.trim() || undefined, stars: Number($('#pf-stars', wrap).value) || undefined }
+    await api('/api/proof', { method: 'POST', body: JSON.stringify(body) })
+    close(); renderApp('proof')
+  }
+}
+
+/* ===================== CONTENT → LEADS ===================== */
+const CONTENT_STATUS = [['idea', 'Idea'], ['draft', 'Draft'], ['scheduled', 'Scheduled'], ['posted', 'Posted']]
+const CONTENT_PILL = { idea: 'lead', draft: 'lead', scheduled: 'quoted', posted: 'completed' }
+async function viewContent() {
+  const d = await api('/api/content'); const items = d.content || []; const s = d.summary || {}; const winners = d.winners || []
+  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn primary" id="ct-add">${I.plus} Log a piece</button>`; $('#ct-add').onclick = () => openContent() }
+  const top = winners.filter((w) => (w.leads_attributed || 0) > 0)
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} What actually pulls leads in</span>
+      <p>Not likes — leads. Log every post and tick a lead when something lands in your DMs because of it. The pieces that produce real jobs rise to the top — pour your energy there, drop the rest.</p></div>
+    <div class="kpis">
+      <div class="kpi"><div class="lab">Pieces</div><div class="val">${s.pieces || 0}</div><div class="meta">logged</div></div>
+      <div class="kpi"><div class="lab">Posted</div><div class="val">${s.posted || 0}</div><div class="meta">live</div></div>
+      <div class="kpi primary"><div class="lab">Leads from content</div><div class="val">${s.total_leads || 0}</div><div class="meta">DMs it pulled</div></div>
+      <div class="kpi"><div class="lab">Top piece</div><div class="val">${top.length ? (top[0].leads_attributed || 0) : 0}</div><div class="meta">${top.length ? esc((top[0].title || '').slice(0, 18)) : 'none yet'}</div></div>
+    </div>
+    ${top.length ? `<div class="sec-h"><span class="label">Winners — pour energy here</span><span class="ct">${top.length}</span></div>
+      <div class="list">${top.slice(0, 5).map(contentRow).join('')}</div>` : ''}
+    <div class="sec-h"><span class="label">All content</span><span class="ct">${items.length}</span></div>
+    ${items.length ? `<div class="list">${items.map(contentRow).join('')}</div>`
+      : emptyState('Nothing logged yet', 'Log your first post — the "shop said $X, I did $Y" reel, the brake job clip. Then mark a lead every time one shows up because of it, and let the winners surface.')}
+  `)
+  bindContent()
+}
+function contentRow(c) {
+  const st = c.status || 'posted'
+  const leads = c.leads_attributed || 0
+  return `<div class="lrow ct-row">
+    <div class="grow">
+      <div class="nm">${c.url ? `<a class="ct-link" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title || 'Untitled')}</a>` : esc(c.title || 'Untitled')}</div>
+      <div class="qmeta">
+        <span class="pill ${CONTENT_PILL[st] || 'lead'}"><span class="dot"></span>${esc((CONTENT_STATUS.find((x) => x[0] === st) || [, st])[1])}</span>
+        ${c.channel ? `<span class="age-tag">${esc(c.channel)}</span>` : ''}
+        <span class="lead-tag ${leads ? 'on' : ''}">${leads} lead${leads === 1 ? '' : 's'}</span>
+        ${c.posted_at || c.created_at ? `<span class="ct-when">${ago(c.posted_at || c.created_at)} ago</span>` : ''}
+      </div>
+    </div>
+    <div class="qright">
+      <div class="lead-stepper">
+        <button class="step-btn" data-ct-dec="${c.id}" title="Remove a lead">−</button>
+        <b class="num">${leads}</b>
+        <button class="step-btn primary" data-ct-inc="${c.id}" title="A lead came from this">+</button>
+      </div>
+      <div class="qacts"><button class="btn ghost sm" data-ct-del="${c.id}">${I.x}</button></div>
+    </div>
+  </div>`
+}
+function bindContent() {
+  app.querySelectorAll('[data-ct-inc]').forEach((b) => (b.onclick = async () => { await api(`/api/content/${b.dataset.ctInc}/attribute`, { method: 'POST', body: JSON.stringify({ delta: 1 }) }); renderApp('content') }))
+  app.querySelectorAll('[data-ct-dec]').forEach((b) => (b.onclick = async () => { await api(`/api/content/${b.dataset.ctDec}/attribute`, { method: 'POST', body: JSON.stringify({ delta: -1 }) }); renderApp('content') }))
+  app.querySelectorAll('[data-ct-del]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Delete this piece?')) return
+    await api(`/api/content/${b.dataset.ctDel}/delete`, { method: 'POST' }); renderApp('content')
+  }))
+}
+function openContent() {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Log a piece</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Title</label><input class="input" id="ct-title" placeholder='e.g. "Shop quoted $2,400 — I did it for less" reel'></div>
+      <div class="field"><label>Channel</label><input class="input" id="ct-channel" placeholder="Instagram, TikTok, Google post…"></div>
+      <div class="field"><label>Status</label>
+        <select class="input" id="ct-status">${CONTENT_STATUS.map(([v, l]) => `<option value="${v}" ${v === 'posted' ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Link (optional)</label><input class="input" id="ct-url" placeholder="https://…"></div>
+      <div class="field"><label>Note (optional)</label><input class="input" id="ct-notes" placeholder="The angle / what worked"></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="ct-save">Log it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#ct-save', wrap).onclick = async () => {
+    const title = $('#ct-title', wrap).value.trim(); if (!title) return
+    const body = { title, channel: $('#ct-channel', wrap).value.trim() || undefined, status: $('#ct-status', wrap).value, url: $('#ct-url', wrap).value.trim() || undefined, notes: $('#ct-notes', wrap).value.trim() || undefined }
+    await api('/api/content', { method: 'POST', body: JSON.stringify(body) })
+    close(); renderApp('content')
+  }
+}
+
+/* ===================== ASSETS LIBRARY ===================== */
+const LIB_KINDS = [['', 'All'], ['photo', 'Photos'], ['clip', 'Clips'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['doc', 'Docs']]
+let _libFilter = { kind: '', is_before: '' }
+async function viewAssets() {
+  const tr = $('.topbar .right'); if (tr) tr.innerHTML = ''
+  setView(`<div id="lib-wrap"><div class="loading">Loading…</div></div>`)
+  await loadLibrary()
+}
+async function loadLibrary() {
+  const qs = []
+  if (_libFilter.kind) qs.push('kind=' + encodeURIComponent(_libFilter.kind))
+  if (_libFilter.is_before) qs.push('is_before=' + encodeURIComponent(_libFilter.is_before))
+  const d = await api('/api/assets' + (qs.length ? '?' + qs.join('&') : ''))
+  const assets = d.assets || [], byKind = d.by_kind || {}
+  const host = $('#lib-wrap'); if (!host) return
+  const chips = LIB_KINDS.map(([v, l]) => `<button class="lib-chip ${_libFilter.kind === v ? 'on' : ''}" data-lib-kind="${v}">${l}${v && byKind[v] ? ` <b>${byKind[v]}</b>` : ''}</button>`).join('')
+  host.innerHTML = `
+    <div class="brief"><span class="tag">${I.bolt} Every job, one shelf</span>
+      <p>All the photos and clips off your jobs, pulled out of your camera roll and tied to who and what they're from. Reuse them for content and to close — the before/after that sells the next big one.</p></div>
+    <div class="lib-bar">
+      <div class="lib-chips">${chips}</div>
+      <button class="lib-chip before ${_libFilter.is_before === 'true' ? 'on' : ''}" data-lib-before>${I.spark} Before shots</button>
+    </div>
+    ${assets.length
+      ? `<div class="sec-h"><span class="label">${_libFilter.kind ? (LIB_KINDS.find((k) => k[0] === _libFilter.kind) || [, 'Assets'])[1] : 'All assets'}${_libFilter.is_before === 'true' ? ' · before' : ''}</span><span class="ct">${d.total || assets.length}</span></div>
+        <div class="lib-grid">${assets.map(libTile).join('')}</div>`
+      : emptyState('Nothing here yet', 'Attach photos and clips from the job drawer — they all flow into this shelf, organized and ready to reuse for content or to show the next customer.')}
+  `
+  host.querySelectorAll('[data-lib-kind]').forEach((b) => (b.onclick = () => { _libFilter.kind = b.dataset.libKind; loadLibrary() }))
+  const bf = host.querySelector('[data-lib-before]'); if (bf) bf.onclick = () => { _libFilter.is_before = _libFilter.is_before === 'true' ? '' : 'true'; loadLibrary() }
+  host.querySelectorAll('[data-lib-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.libJob)))
+}
+function libTile(a) {
+  const isImg = a.kind === 'photo'
+  return `<div class="lib-tile">
+    <div class="lib-tile__media ${isImg ? '' : 'doc'}" ${a.job_id ? `data-lib-job="${a.job_id}"` : ''}>
+      ${isImg ? `<img src="${esc(a.url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">` : `<span class="lib-kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}
+      ${a.is_before ? '<span class="lib-before">BEFORE</span>' : ''}
+      <a class="lib-open" href="${esc(a.url)}" target="_blank" rel="noopener" title="Open">${I.arrow}</a>
+    </div>
+    <div class="lib-tile__meta" ${a.job_id ? `data-lib-job="${a.job_id}"` : ''}>
+      <div class="lib-tile__lbl">${esc(a.label || a.kind || 'attachment')}</div>
+      <div class="lib-tile__sub">${esc([a.customer, a.vehicle].filter(Boolean).join(' · ') || (a.issue || a.service || ''))}</div>
+    </div>
+  </div>`
+}
+
+/* ===================== RE-CONTACT ===================== */
+function recontactRow(j, overdue) {
+  return `<div class="lrow rc-row ${overdue ? 'over' : ''}">
+    <div class="grow" ${j.job_id ? `data-job="${j.job_id}"` : ''}>
+      <div class="nm">${esc(j.title || 'Check in')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+      <div class="sub">${esc([j.customer, j.vehicle].filter(Boolean).join(' · ') || (j.body || 'No context'))}</div>
+      ${j.body && (j.customer || j.vehicle) ? `<div class="sub" style="color:var(--fg4)">${esc(j.body)}</div>` : ''}
+    </div>
+    <div class="qright">
+      ${j.due_at ? `<span class="age-tag ${overdue ? 'stale' : ''}">${overdue ? (j.overdue_days > 0 ? j.overdue_days + 'd overdue' : 'due now') : 'due ' + esc(new Date(j.due_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' }))}</span>` : '<span class="age-tag stale">whenever</span>'}
+      <div class="qacts">
+        ${j.phone ? `<a class="btn ghost sm" href="tel:${esc(j.phone)}">${I.phone}</a>` : ''}
+        <button class="btn primary sm" data-rc-done="${j.id}">${I.check} Done</button>
+      </div>
+    </div>
+  </div>`
+}
+function bindRecontact(scope) {
+  (scope || app).querySelectorAll('.rc-row .grow[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  ;(scope || app).querySelectorAll('[data-rc-done]').forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation(); await api(`/api/recontact/${b.dataset.rcDone}/done`, { method: 'POST' })
+    if (tab === 'pulse') renderApp('pulse'); else renderApp()
+  }))
+}
+
+/* Schedule a future check-in from a job drawer */
+function openRecontact(j) {
+  const wrap = document.createElement('div')
+  const presets = [['+7', 'In 1 week'], ['+30', 'In 1 month'], ['+90', 'In 3 months'], ['+180', 'In 6 months'], ['+365', 'In a year']]
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Schedule a check-in</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>What to check on</label><input class="input" id="rc-title" placeholder="e.g. That ${esc(j.vehicle || 'Volvo')} belt was borderline — see how it's holding"></div>
+      <div class="field"><label>When</label>
+        <div class="rc-presets">${presets.map(([v, l], i) => `<button class="rc-chip ${i === 2 ? 'on' : ''}" data-rc-when="${v}">${l}</button>`).join('')}</div></div>
+      <div class="field"><label>Or pick a date</label><input class="input" id="rc-date" type="date"></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="rc-save">${I.plus} Schedule it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  let offset = 90
+  const chips = wrap.querySelectorAll('[data-rc-when]')
+  chips.forEach((b) => (b.onclick = () => { chips.forEach((x) => x.classList.remove('on')); b.classList.add('on'); offset = Number(b.dataset.rcWhen.replace('+', '')); $('#rc-date', wrap).value = '' }))
+  $('#rc-save', wrap).onclick = async () => {
+    const title = $('#rc-title', wrap).value.trim() || `Check in on ${j.customer || 'this customer'}`
+    let due
+    const picked = $('#rc-date', wrap).value
+    if (picked) due = new Date(picked + 'T12:00:00').toISOString()
+    else { const dt = new Date(); dt.setDate(dt.getDate() + offset); due = dt.toISOString() }
+    await api('/api/recontact', { method: 'POST', body: JSON.stringify({ title, due_at: due, job_id: j.id, customer_id: j.customer_id || undefined }) })
+    close()
+  }
+}
+
+/* Won-workflow fired-checklist confirmation */
+function showWonChecklist(res, customer) {
+  const list = res.checklist || []
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">${I.check} Won — ${esc(customer || 'job')} is on the board</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="won-line">Booked at <b class="num">${money(res.charge)}</b> flat${res.profit != null ? ` · <span class="${res.below_floor ? 'won-bad' : 'won-ok'}">${money(res.profit)} profit</span>` : ''}</div>
+      ${res.below_floor ? `<div class="floor-warn">Under the $1,000 profit floor — make sure the price holds up.</div>` : ''}
+      <div class="label" style="margin-top:var(--s2)">Auto-fired for you</div>
+      <div class="won-checklist">${list.length ? list.map((c) => `
+        <div class="won-item"><span class="won-ic">${I.check}</span>
+          <div><div class="won-t">${esc(c.title || (c.kind === 'review_ask' ? 'Ask for the review' : 'Capture the after photos'))}</div>
+            ${c.when || c.due_at ? `<div class="won-when">${esc(c.when || ('due ' + new Date(c.due_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })))}</div>` : ''}</div></div>`).join('')
+        : '<div class="won-when">Scheduled and status updated.</div>'}</div>
+    </div>
+    <div class="modal__f"><button class="btn primary mclose">Got it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+}
+
+/* Inject the Re-contact "due now" panel into the Pulse (additive wrap, like Wave 2). */
+const _renderApp_w4 = renderApp
+renderApp = async function (next) {
+  await _renderApp_w4(next)
+  if (tab !== 'pulse') return
+  const mp = $('.mini-panels')
+  if (mp && !$('.rc-panel')) {
+    let d; try { d = await api('/api/recontact') } catch (e) { d = null }
+    const due = d && d.due ? d.due : []
+    const upcoming = d && d.count ? (d.count.upcoming || 0) : 0
+    const panel = document.createElement('div')
+    panel.className = 'panel rc-panel'
+    panel.style.gridColumn = '1 / -1'
+    panel.innerHTML = `<div class="mini-h">Re-contact · scheduled energy coming due${upcoming ? ` <span class="rc-up">+${upcoming} upcoming</span>` : ''}</div>
+      ${due.length ? `<div class="list">${due.map((j) => recontactRow(j, true)).join('')}</div>`
+        : `<div class="needs-clear">Nothing due. Schedule a check-in from any job — that Volvo belt, the Impala exhaust — and it surfaces here when it's time.</div>`}`
+    mp.appendChild(panel)
+    bindRecontact(panel)
+  }
 }
 
 if (token) renderApp('pulse'); else renderLogin()
