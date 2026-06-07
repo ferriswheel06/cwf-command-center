@@ -798,8 +798,8 @@ textarea.input.ta{height:auto}
 .jc{padding:var(--s4);gap:var(--s2)}
 .jc__top{align-items:flex-start;gap:var(--s2)}
 .jc__top>div:first-child{flex:1;min-width:0}
-.jc .nm{min-width:0;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
-.jc .veh,.jc .iss{overflow-wrap:anywhere}
+.jc .nm{min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
+.jc .veh,.jc .iss{overflow-wrap:break-word}
 .jc .iss{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .col__b{gap:var(--s3)}
 

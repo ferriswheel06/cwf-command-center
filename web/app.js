@@ -93,7 +93,7 @@ else if (tab === 'field') await viewField()
 }
 
 function tierBadge(j) {
-  if (j.ticket_tier === 'HIGH') return `<span class="ai-score high">${I.spark}HIGH-TICKET</span>`
+  if (j.ticket_tier === 'HIGH') return `<span class="ai-score high">${I.spark}HIGH</span>`
   return `<span class="ai-score">${I.spark}Standard</span>`
 }
 function emptyState(ttl, sub) { return `<div class="empty"><div class="ic">${I.bolt}</div><div class="ttl">${esc(ttl)}</div><div class="sub">${esc(sub)}</div></div>` }
