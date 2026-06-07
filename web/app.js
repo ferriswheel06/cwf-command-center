@@ -78,8 +78,17 @@ async function viewToday() {
     <div class="brief"><span class="ai-tag">Today</span><div>${focusLine(s, leads)}</div></div>
     <div class="section-h">New leads</div>
     ${leads.length ? `<div class="lead-list">${leads.map(leadRow).join('')}</div>` : `<div class="empty">Nothing's rotting. Go get a lead.</div>`}
+    <div class="section-h">Recent jobs</div>
+    <div class="lead-list">${(d.recent || []).map(jobLine).join('') || `<div class="empty">No jobs yet.</div>`}</div>
   `)
   bindContact()
+}
+function jobLine(j) {
+  return `<div class="lead-row">
+    <div class="grow"><div class="nm">${esc(j.name || 'Unknown')}</div><div class="sub">${esc(j.issue || '')}</div></div>
+    <span class="amt">${money(j.charge || j.est_value)}</span>
+    <span class="status-pill ${esc(j.status)}">${esc(j.status)}</span>
+  </div>`
 }
 function leadRow(l) {
   const band = l.ai_band ? `<span class="pill ${l.ai_band}">${l.ai_score || ''} ${l.ai_band}</span>` : ''

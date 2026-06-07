@@ -84,7 +84,10 @@ app.get('/api/today', auth, async (c) => {
   const leads = (await q(`select j.id, c.name, j.issue, j.est_value, j.ai_score, j.ai_band, j.created_at, j.first_contact_at
       from jobs j join customers c on c.id=j.customer_id
       where j.business_id=$1 and j.status='lead' order by j.created_at desc`, [b])).rows
-  return c.json({ stats, targets, leads })
+  const recent = (await q(`select j.id, j.status, j.issue, j.charge, j.est_value, c.name
+      from jobs j join customers c on c.id=j.customer_id
+      where j.business_id=$1 order by j.created_at desc limit 6`, [b])).rows
+  return c.json({ stats, targets, leads, recent })
 })
 
 // ---- PIPELINE ----
