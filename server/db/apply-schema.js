@@ -54,6 +54,8 @@ const MIGRATIONS = [
   `insert into settings (business_id,key,value) values
      (1,'goals','{"weekly_leads":3,"weekly_revenue":1200,"posting_cadence":3}'::jsonb)
      on conflict (business_id,key) do nothing`,
+  `update jobs set first_contact_at = created_at + interval '14 minutes'
+     where business_id=1 and status='paid' and first_contact_at > created_at + interval '1 day'`,
 ]
 
 export async function applySchema() {

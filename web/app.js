@@ -103,6 +103,7 @@ function goalBar(name, val, target, isMoney) {
   return `<div class="gb"><div class="gb__top"><span>${name}</span><b class="num">${f(val)} / ${f(target)}</b></div>
     <div class="goal__track"><div class="goal__fill ${pct >= 100 ? 'over' : ''}" style="width:${pct}%"></div></div></div>`
 }
+function fmtReply(m) { if (m == null) return 'no replies yet'; if (m < 60) return m + 'm reply'; if (m < 1440) return Math.round(m / 60) + 'h reply'; return Math.round(m / 1440) + 'd reply' }
 async function viewPulse() {
   const d = await api('/api/pulse'); const e = d.energy || {}, v = d.voice || {}, om = d.oneMove || {}, g = d.goals || {}
   const deltaTxt = e.delta == null ? 'first read' : (e.delta > 0 ? `▲ ${e.delta} vs last` : e.delta < 0 ? `▼ ${Math.abs(e.delta)} vs last` : 'flat vs last')
@@ -124,7 +125,7 @@ async function viewPulse() {
     <div class="triptych">
       ${voiceCard('Transmit', `${v.transmit ? v.transmit.posts_wk : 0}/${v.transmit ? v.transmit.cadence : 3} posts`, v.transmit && v.transmit.status, v.transmit && v.transmit.findable ? 'Findable on Google' : 'Not findable yet', 'Did the voice go out?')}
       ${voiceCard('Hear', `${v.hear ? v.hear.new_leads : 0} new`, v.hear && v.hear.status, 'inbound this week', 'Did anyone hear it?')}
-      ${voiceCard('Respond', `${v.respond ? v.respond.open_leads : 0} open`, v.respond && v.respond.status, v.respond && v.respond.median_reply == null ? 'no replies yet' : `${v.respond.median_reply}m reply`, 'Did you answer fast?')}
+      ${voiceCard('Respond', `${v.respond ? v.respond.open_leads : 0} open`, v.respond && v.respond.status, fmtReply(v.respond ? v.respond.median_reply : null), 'Did you answer fast?')}
     </div>
     <div class="sec-h"><span class="label">This week</span></div>
     <div class="panel goals-panel">
