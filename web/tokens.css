@@ -1,0 +1,44 @@
+/* Cars With Fares — Command Center · design tokens (the system) */
+:root{
+  /* surfaces — 5-step elevation ramp */
+  --bg:#050506; --bg2:#0d0e11; --bg3:#131519; --bg4:#1a1d22; --bg5:#22262d;
+  /* text — 4 deliberate tiers (AA on --bg2) */
+  --fg:#F4F5F7; --fg2:#C5C9D3; --fg3:#868B98; --fg4:#565B6B;
+  /* brand */
+  --navy:#6EAAFF; --navy-d:rgba(110,170,255,.12);
+  --accent:#E0922E; --accent-h:#F0A340; --accent-d:rgba(224,146,46,.14); --accent-bd:rgba(224,146,46,.35);
+  /* status */
+  --green:#44D07F; --green-d:rgba(68,208,127,.12);
+  --yellow:#F5C84B; --yellow-d:rgba(245,200,75,.12);
+  --red:#F6736B; --red-d:rgba(246,115,107,.12);
+  --purple:#A78BFA; --purple-d:rgba(167,139,250,.12);
+  /* AI — reserved violet ("the machine did this") */
+  --ai:#8B7CF6; --ai-2:#B3A6FF; --ai-d:rgba(139,124,246,.13); --ai-grad:linear-gradient(135deg,#8B7CF6,#5BB0FF);
+  /* lines & depth */
+  --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.04); --line3:rgba(255,255,255,.11);
+  --ring:0 0 0 3px rgba(224,146,46,.30);
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.45);
+  --shadow-lg:0 8px 40px rgba(0,0,0,.7);
+  --shadow-pop:0 4px 24px rgba(0,0,0,.55);
+  /* type */
+  --font:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,'SF Mono',monospace;
+  /* spacing — strict 8pt (+4pt half) */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px; --s8:64px;
+  /* radii */
+  --r:8px; --r2:6px; --r3:12px; --rp:999px;
+  /* motion */
+  --ease:cubic-bezier(.2,.7,.2,1); --ease-spring:cubic-bezier(.22,.68,0,1.2);
+  --tf:120ms; --tt:180ms; --ts:260ms;
+  /* shell */
+  --sidebar:220px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:14px}
+body{background:var(--bg);color:var(--fg2);font-family:var(--font);-webkit-font-smoothing:antialiased;line-height:1.5}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+button{cursor:pointer;border:none;background:none}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+svg{display:block}
+::selection{background:var(--accent-d)}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}

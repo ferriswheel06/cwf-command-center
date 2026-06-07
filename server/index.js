@@ -17,27 +17,26 @@ const pool = new Pool({
 const q = (text, params) => pool.query(text, params)
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me'
-const AI_URL = (process.env.AI_SERVICE_URL || 'https://api.carswithfares.ca').replace(/\/$/, '')
 
-export async function aiCall(path, body) {
-  const r = await fetch(`${AI_URL}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  if (!r.ok) throw new Error(`AI bridge ${path} -> ${r.status}`)
-  return r.json()
-}
+// --- heuristics (real AI scoring via the Worker is a later bolt-on) ---
+const HIGH_RE = /suspension|control arm|ball joint|engine|transmission|clutch|alternator|timing|head gasket|strut|shock|no.?start|axle|differential|turbo|rack|cv|rebuild|head/i
+const SAFETY_RE = /brake|steering|overheat|knock|smoke|stall|grinding|wobble|no.?brake/i
+const tierOf = (issue, est) => (Number(est) || 0) >= 700 || HIGH_RE.test(issue || '') ? 'HIGH' : 'STANDARD'
+const safetyOf = (issue) => SAFETY_RE.test(issue || '')
 
-// Seed the 2 real jobs the first time (idempotent — only if the pipeline is empty).
+// --- seed the 2 real jobs the first time ---
 async function seedIfEmpty() {
   try {
     const { rows } = await q('select count(*)::int as n from jobs')
     if (rows[0].n > 0) return
     const rob = (await q(`insert into customers (business_id,name,location,source) values (1,$1,$2,'referral') returning id`, ['Rob', 'Mississauga'])).rows[0]
     const robV = (await q(`insert into vehicles (business_id,customer_id,notes) values (1,$1,'Suspension') returning id`, [rob.id])).rows[0]
-    await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,service,source,charge,est_value,is_high_ticket,first_contact_at,paid_at,created_at)
-             values (1,$1,$2,'paid','Full suspension refresh','Suspension','referral',1400,1400,true,now(),timestamptz '2026-05-30',timestamptz '2026-05-28')`, [rob.id, robV.id])
+    await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,service,source,charge,est_value,is_high_ticket,ticket_tier,first_contact_at,paid_at,created_at)
+             values (1,$1,$2,'paid','Full suspension refresh','Suspension','referral',1400,1400,true,'HIGH',now(),timestamptz '2026-05-30',timestamptz '2026-05-28')`, [rob.id, robV.id])
     const geo = (await q(`insert into customers (business_id,name,location,source) values (1,$1,$2,'referral') returning id`, ['George (Brothers Deals On Wheels)', 'Oakville'])).rows[0]
     const geoV = (await q(`insert into vehicles (business_id,customer_id,make,model,notes) values (1,$1,'Ram','2500','Diesel service') returning id`, [geo.id])).rows[0]
-    await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,service,source,charge,est_value,is_high_ticket,first_contact_at,paid_at,created_at)
-             values (1,$1,$2,'paid','Ram 2500 diesel service','Diesel service','referral',450,450,false,now(),timestamptz '2026-03-22',timestamptz '2026-03-20')`, [geo.id, geoV.id])
+    await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,service,source,charge,est_value,is_high_ticket,ticket_tier,first_contact_at,paid_at,created_at)
+             values (1,$1,$2,'paid','Ram 2500 diesel service','Diesel service','referral',450,450,false,'STANDARD',now(),timestamptz '2026-03-22',timestamptz '2026-03-20')`, [geo.id, geoV.id])
     console.log('[seed] inserted 2 real jobs ✓')
   } catch (e) { console.error('[seed] failed:', e.message) }
 }
@@ -47,6 +46,7 @@ app.use('/api/*', cors())
 
 // ---- static cockpit UI ----
 app.get('/', serveStatic({ path: './web/index.html' }))
+app.get('/tokens.css', serveStatic({ path: './web/tokens.css' }))
 app.get('/style.css', serveStatic({ path: './web/style.css' }))
 app.get('/app.js', serveStatic({ path: './web/app.js' }))
 
@@ -71,35 +71,55 @@ const auth = async (c, next) => {
 const biz = (c) => c.get('claims').business_id
 app.get('/api/me', auth, (c) => c.json({ business_id: biz(c) }))
 
+// ---- shared selects ----
+const JOB_COLS = `j.id, j.status, j.issue, j.service, j.source, j.charge, j.est_value, j.parts_cost, j.gas_cost, j.est_profit,
+  j.ticket_tier, j.likely_cause, j.safety_flag, j.is_high_ticket, j.first_contact_at, j.scheduled_date, j.follow_up_at, j.created_at,
+  c.name as customer, c.phone, c.location, nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle`
+const JOB_FROM = `from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id`
+
 // ---- TODAY ----
 app.get('/api/today', auth, async (c) => {
   const b = biz(c)
   const stats = (await q(`select
       coalesce(sum(charge) filter (where status='paid'),0)::float as revenue,
       count(*) filter (where status='paid')::int as paid_jobs,
-      count(*) filter (where status='lead')::int as new_leads
+      count(*) filter (where status='lead')::int as new_leads,
+      count(*) filter (where status not in ('paid','lost'))::int as open_jobs
     from jobs where business_id=$1`, [b])).rows[0]
   stats.avg_ticket = stats.paid_jobs ? Math.round(stats.revenue / stats.paid_jobs) : 0
-  const targets = (await q(`select value from settings where business_id=$1 and key='targets'`, [b])).rows[0]?.value || {}
-  const leads = (await q(`select j.id, c.name, j.issue, j.est_value, j.ai_score, j.ai_band, j.created_at, j.first_contact_at
-      from jobs j join customers c on c.id=j.customer_id
-      where j.business_id=$1 and j.status='lead' order by j.created_at desc`, [b])).rows
-  const recent = (await q(`select j.id, j.status, j.issue, j.charge, j.est_value, c.name
-      from jobs j join customers c on c.id=j.customer_id
-      where j.business_id=$1 order by j.created_at desc limit 6`, [b])).rows
-  return c.json({ stats, targets, leads, recent })
+  const callFirst = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status in ('lead','quoted')
+      order by (j.ticket_tier='HIGH') desc, j.created_at desc limit 12`, [b])).rows
+  const stale = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status in ('lead','quoted') and j.created_at < now() - interval '3 days'
+      order by j.created_at asc limit 12`, [b])).rows
+  const scheduledToday = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.scheduled_date = current_date order by j.created_at`, [b])).rows
+  const unpaid = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status='completed' order by j.created_at`, [b])).rows
+  // computed brief (real AI narration is a later bolt-on)
+  const hot = callFirst.find((l) => l.ticket_tier === 'HIGH')
+  let brief = `You're at $${stats.revenue.toLocaleString()} all-time across ${stats.paid_jobs} paid jobs (avg $${stats.avg_ticket.toLocaleString()}). `
+  if (hot) brief += `Call ${hot.customer} first — high-ticket${hot.issue ? ` (${hot.issue})` : ''}. `
+  else if (callFirst.length) brief += `${callFirst.length} lead${callFirst.length > 1 ? 's' : ''} to work. `
+  else brief += `No leads in the pipe — flip an activation gate to turn the machine on. `
+  if (stale.length) brief += `${stale.length} going stale. `
+  if (unpaid.length) brief += `${unpaid.length} job${unpaid.length > 1 ? 's' : ''} completed and unpaid. `
+  return c.json({ stats, brief, callFirst, stale, scheduledToday, unpaid })
 })
 
 // ---- PIPELINE ----
 app.get('/api/jobs', auth, async (c) => {
-  const rows = (await q(`select j.id, j.status, j.issue, j.service, j.charge, j.est_value, j.ai_score, j.ai_band,
-      j.is_high_ticket, j.first_contact_at, j.created_at, c.name as customer, c.location,
-      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
-    from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id
-    where j.business_id=$1 order by j.created_at desc`, [biz(c)])).rows
+  const rows = (await q(`select ${JOB_COLS} ${JOB_FROM} where j.business_id=$1 order by j.created_at desc`, [biz(c)])).rows
   return c.json({ jobs: rows })
 })
-
+app.get('/api/jobs/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const job = (await q(`select ${JOB_COLS}, c.id as customer_id, c.email ${JOB_FROM} where j.id=$1 and j.business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  const activity = (await q(`select type, body, created_at from activity where job_id=$1 order by created_at desc`, [id])).rows
+  return c.json({ job, activity })
+})
 const FLOW = ['lead', 'quoted', 'scheduled', 'in_progress', 'completed', 'paid']
 app.post('/api/jobs/:id/advance', auth, async (c) => {
   const id = c.req.param('id'), b = biz(c)
@@ -111,44 +131,100 @@ app.post('/api/jobs/:id/advance', auth, async (c) => {
   await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'status_change',$3)`, [b, id, `→ ${next}`])
   return c.json({ status: next })
 })
-
 app.post('/api/jobs/:id/contact', auth, async (c) => {
   const id = c.req.param('id'), b = biz(c)
   await q(`update jobs set first_contact_at=coalesce(first_contact_at,now()) where id=$1 and business_id=$2`, [id, b])
   await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'contact','Contacted')`, [b, id])
   return c.json({ ok: true })
 })
+// quote builder ($1k profit floor, flat, no tax)
+app.post('/api/jobs/:id/quote', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const charge = Number(d.charge) || 0, parts = Number(d.parts_cost) || 0, gas = Number(d.gas_cost) || 0
+  const profit = charge - parts - gas
+  await q(`update jobs set charge=$1, parts_cost=$2, gas_cost=$3, est_profit=$4, status=case when status='lead' then 'quoted' else status end
+           where id=$5 and business_id=$6`, [charge, parts, gas, profit, id, b])
+  await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'quote',$3)`, [b, id, `Quoted $${charge} · profit $${profit}`])
+  return c.json({ charge, parts_cost: parts, gas_cost: gas, profit, below_floor: profit < 1000 })
+})
+app.patch('/api/jobs/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const sets = [], vals = []
+  for (const k of ['status', 'issue', 'service', 'scheduled_date', 'notes']) {
+    if (d[k] !== undefined) { vals.push(d[k]); sets.push(`${k}=$${vals.length}`) }
+  }
+  if (!sets.length) return c.json({ error: 'nothing to update' }, 400)
+  vals.push(id, b)
+  await q(`update jobs set ${sets.join(', ')} where id=$${vals.length - 1} and business_id=$${vals.length}`, vals)
+  return c.json({ ok: true })
+})
 
-// ---- create lead ----
+// ---- create lead (manual; mirrors the Worker intake contract) ----
 app.post('/api/leads', auth, async (c) => {
   const b = biz(c), d = await c.req.json().catch(() => ({}))
   if (!d.name && !d.phone) return c.json({ error: 'need a name or phone' }, 400)
   const norm = d.phone ? String(d.phone).replace(/\D/g, '').slice(-10) : null
   let cust = norm ? (await q(`select id from customers where business_id=$1 and phone_normalized=$2`, [b, norm])).rows[0] : null
-  if (!cust) cust = (await q(`insert into customers (business_id,name,phone,phone_normalized,location,source) values ($1,$2,$3,$4,$5,'manual') returning id`,
-    [b, d.name || null, d.phone || null, norm, d.location || null])).rows[0]
+  if (!cust) cust = (await q(`insert into customers (business_id,name,phone,phone_normalized,location,source) values ($1,$2,$3,$4,$5,$6) returning id`,
+    [b, d.name || null, d.phone || null, norm, d.location || null, d.source || 'manual'])).rows[0]
   let vId = null
   if (d.vehicle) vId = (await q(`insert into vehicles (business_id,customer_id,notes) values ($1,$2,$3) returning id`, [b, cust.id, d.vehicle])).rows[0].id
   const est = d.est_value ? Number(String(d.est_value).replace(/[^\d.]/g, '')) : null
-  const job = (await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,est_value,is_high_ticket,source) values ($1,$2,$3,'lead',$4,$5,$6,'manual') returning id`,
-    [b, cust.id, vId, d.issue || null, est, est != null && est >= 700])).rows[0]
+  const tier = tierOf(d.issue, est), safety = safetyOf(d.issue)
+  const job = (await q(`insert into jobs (business_id,customer_id,vehicle_id,status,issue,service,est_value,is_high_ticket,ticket_tier,safety_flag,source)
+      values ($1,$2,$3,'lead',$4,$5,$6,$7,$8,$9,$10) returning id`,
+    [b, cust.id, vId, d.issue || null, d.service || null, est, tier === 'HIGH', tier, safety, d.source || 'manual'])).rows[0]
   await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'system','Lead created')`, [b, job.id])
-  return c.json({ id: job.id })
+  return c.json({ id: job.id, ticket_tier: tier, safety_flag: safety })
 })
 
-// ---- MONEY ----
+// ---- MONEY (funnel/targets + profit) ----
 app.get('/api/money', auth, async (c) => {
   const b = biz(c)
   const m = (await q(`select
       coalesce(sum(charge) filter (where status='paid'),0)::float as revenue,
+      coalesce(sum(coalesce(charge,0)-coalesce(parts_cost,0)-coalesce(gas_cost,0)) filter (where status='paid'),0)::float as profit,
       count(*) filter (where status='paid')::int as paid,
       count(*) filter (where status='lead')::int as leads,
       count(*) filter (where status in ('quoted','scheduled','in_progress'))::int as active,
-      count(*) filter (where status='lost')::int as lost
+      count(*) filter (where status='lost')::int as lost,
+      count(*)::int as total_jobs,
+      coalesce(sum(charge) filter (where status='paid' and paid_at > now() - interval '12 months'),0)::float as rolling12
     from jobs where business_id=$1`, [b])).rows[0]
-  const targets = (await q(`select value from settings where business_id=$1 and key='targets'`, [b])).rows[0]?.value || {}
   m.avg_ticket = m.paid ? Math.round(m.revenue / m.paid) : 0
-  return c.json({ ...m, targets })
+  const targets = (await q(`select value from settings where business_id=$1 and key='growth_targets'`, [b])).rows[0]?.value || {}
+  const views = (await q(`select coalesce(sum(views),0)::int as v from traffic where business_id=$1`, [b])).rows[0].v
+  const funnel = { views, contacts: m.total_jobs, jobs: m.paid, revenue: m.revenue }
+  return c.json({ ...m, targets, funnel })
+})
+app.get('/api/targets', auth, async (c) => {
+  const t = (await q(`select value from settings where business_id=$1 and key='growth_targets'`, [biz(c)])).rows[0]?.value || {}
+  return c.json(t)
+})
+app.put('/api/targets', auth, async (c) => {
+  const d = await c.req.json().catch(() => ({}))
+  await q(`insert into settings (business_id,key,value) values ($1,'growth_targets',$2::jsonb)
+           on conflict (business_id,key) do update set value=$2::jsonb, updated_at=now()`, [biz(c), JSON.stringify(d)])
+  return c.json({ ok: true })
+})
+app.post('/api/traffic', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const day = d.day || new Date().toISOString().slice(0, 10), views = Number(d.views) || 0
+  await q(`insert into traffic (business_id,day,views) values ($1,$2,$3)
+           on conflict (business_id,day) do update set views=$3`, [b, day, views])
+  return c.json({ ok: true })
+})
+
+// ---- ACTIVATION switchboard ----
+app.get('/api/activation', auth, async (c) => {
+  const rows = (await q(`select id,key,label,status,unlocks,doc_link,sort from activation where business_id=$1 order by sort`, [biz(c)])).rows
+  return c.json({ items: rows })
+})
+app.patch('/api/activation/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  if (!['todo', 'doing', 'done'].includes(d.status)) return c.json({ error: 'bad status' }, 400)
+  await q(`update activation set status=$1, updated_at=now() where id=$2 and business_id=$3`, [d.status, id, b])
+  return c.json({ ok: true })
 })
 
 // ---- boot ----
