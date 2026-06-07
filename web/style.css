@@ -861,3 +861,10 @@ textarea.input.ta{height:auto}
 /* KPI values never collide with their label */
 .kpi .val{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
+/* ===== PLAYBOOK WRAP · long tokens (URLs/emails) + multi-line snippets never overflow (esp. phone) ===== */
+.pb-step__t,.pb-step__d{overflow-wrap:anywhere}
+.pb-snippet{max-width:100%;overflow:hidden}
+.pb-snippet code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.pb-acts{flex-wrap:wrap}
+.pb-drawer .drawer__b{overflow-x:hidden}
+

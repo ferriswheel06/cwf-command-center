@@ -139,6 +139,9 @@ const MIGRATIONS = [
      created_at timestamptz not null default now(),
      done_at timestamptz)`,
   `create index if not exists handoffs_business_idx on handoffs (business_id, status, created_at desc)`,
+  `delete from activity where business_id=1 and body like '%(verify)%'`,
+  `delete from tasks where business_id=1 and (title like '%(verify)%' or coalesce(body,'') like '%(verify)%')`,
+  `delete from handoffs where business_id=1 and title like '%(verify)%'`,
 ]
 
 export async function applySchema() {
