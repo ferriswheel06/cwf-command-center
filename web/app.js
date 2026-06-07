@@ -90,7 +90,7 @@ function gauge(score) {
   return `<svg viewBox="0 0 132 132" width="132" height="132" style="flex-shrink:0">
     <circle cx="66" cy="66" r="${r}" fill="none" stroke="#1a1d22" stroke-width="9"/>
     <circle id="gring" class="gauge-ring" cx="66" cy="66" r="${r}" fill="none" stroke="${col}" stroke-width="9" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${circ.toFixed(1)}" data-target="${off.toFixed(1)}" transform="rotate(-90 66 66)"/>
-    <text id="gscore" x="66" y="64" text-anchor="middle" fill="#F4F5F7" font-size="34" font-weight="700" font-family="'JetBrains Mono',monospace">0</text>
+    <text id="gscore" x="66" y="64" text-anchor="middle" fill="#F4F5F7" font-size="34" font-weight="700" font-family="'JetBrains Mono',monospace">${Math.round(Math.max(0, Math.min(100, score)))}</text>
     <text x="66" y="84" text-anchor="middle" fill="#868B98" font-size="9" letter-spacing="1.5">ENERGY</text></svg>`
 }
 function countUp(el, to, dur = 950) {
@@ -166,11 +166,12 @@ async function viewPulse() {
     if (om.key === 'reply' && om.job_id) { openJob(om.job_id); return }
     await api('/api/pulse/action', { method: 'POST', body: JSON.stringify({ key: om.key }) }); renderApp('pulse')
   }
-  requestAnimationFrame(() => {
-    const ring = $('#gring'); if (ring) requestAnimationFrame(() => { ring.style.strokeDashoffset = ring.dataset.target })
-    countUp($('#gscore'), e.score || 0)
+  setTimeout(() => {
+    const ring = $('#gring'); if (ring) ring.style.strokeDashoffset = ring.dataset.target
     app.querySelectorAll('.goal__fill[data-w]').forEach((f) => { f.style.width = f.dataset.w })
-  })
+  }, 50)
+  countUp($('#gscore'), e.score || 0)
+  setTimeout(() => { const s = $('#gscore'); if (s) s.textContent = e.score || 0 }, 1100)
 }
 
 /* ---------------- TODAY ---------------- */
