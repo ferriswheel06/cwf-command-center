@@ -1,0 +1,5 @@
+node_modules/
+.env
+.deploy-secrets.env
+.railway/
+*.log

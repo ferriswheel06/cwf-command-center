@@ -1,0 +1,20 @@
+{
+  "name": "cwf-command-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cars With Fares — business command center (Railway + Postgres). Free AI bridged to the Cloudflare Workers-AI service.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "db:schema": "node server/db/apply-schema.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "hono": "^4.6.14",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.1"
+  }
+}
