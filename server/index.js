@@ -457,6 +457,142 @@ app.put('/api/attention', auth, async (c) => {
 })
 
 
+// ---- TEMPLATES (Wave 3: fast-reply library) — one-tap personalized replies, trust>price, flat, NO tax ----
+// Tokens supported in body: {name} {vehicle} {issue}. Categories: first_contact|pricing|availability|do_you_do|follow_up|review_ask|general
+app.get('/api/templates', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select id, category, label, body, created_at from templates
+      where business_id=$1 order by category, created_at`, [b])).rows
+  return c.json({ templates: rows })
+})
+app.post('/api/templates', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const label = (d.label || '').toString().trim()
+  const body = (d.body || '').toString().trim()
+  if (!label || !body) return c.json({ error: 'need a label and body' }, 400)
+  const category = (d.category || 'general').toString().trim() || 'general'
+  const row = (await q(`insert into templates (business_id,category,label,body) values ($1,$2,$3,$4)
+      returning id, category, label, body, created_at`, [b, category, label, body])).rows[0]
+  return c.json({ template: row })
+})
+app.put('/api/templates/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const sets = [], vals = []
+  for (const k of ['category', 'label', 'body']) {
+    if (d[k] !== undefined) {
+      const v = (d[k] || '').toString().trim()
+      if ((k === 'label' || k === 'body') && !v) return c.json({ error: `${k} can't be blank` }, 400)
+      vals.push(k === 'category' ? (v || 'general') : v); sets.push(`${k}=$${vals.length}`)
+    }
+  }
+  if (!sets.length) return c.json({ error: 'nothing to update' }, 400)
+  vals.push(id, b)
+  const r = await q(`update templates set ${sets.join(', ')} where id=$${vals.length - 1} and business_id=$${vals.length}`, vals)
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+app.delete('/api/templates/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const r = await q(`delete from templates where id=$1 and business_id=$2`, [id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+
+// ---- TRIAGE (Wave 3: high-value leads jump the queue) ----
+// open leads (lead|quoted) sorted HIGH tier first, then safety, then recency — with the AI read.
+app.get('/api/triage', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select ${JOB_COLS}
+    ${JOB_FROM}
+    where j.business_id=$1 and j.status in ('lead','quoted')
+    order by (j.ticket_tier='HIGH') desc, j.safety_flag desc, j.created_at desc`, [b])).rows
+  const summary = {
+    total: rows.length,
+    high: rows.filter((r) => r.ticket_tier === 'HIGH').length,
+    safety: rows.filter((r) => r.safety_flag).length,
+    uncontacted: rows.filter((r) => !r.first_contact_at).length,
+  }
+  return c.json({ triage: rows, summary })
+})
+
+// ---- ASSETS (Wave 3: file & photo drop per lead) — paste-a-link for now, no binary infra ----
+// kind: photo | clip | quote | invoice | doc
+const ASSET_KINDS = ['photo', 'clip', 'quote', 'invoice', 'doc']
+app.get('/api/jobs/:id/assets', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const job = (await q(`select id from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  const rows = (await q(`select id, kind, url, label, is_before, created_at
+      from assets where business_id=$1 and job_id=$2 order by created_at desc`, [b, id])).rows
+  return c.json({ assets: rows })
+})
+app.post('/api/jobs/:id/assets', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const job = (await q(`select id, customer_id from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  const url = (d.url || '').toString().trim()
+  if (!url) return c.json({ error: 'paste a link' }, 400)
+  const kind = ASSET_KINDS.includes(d.kind) ? d.kind : 'photo'
+  const label = (d.label || '').toString().trim() || null
+  const isBefore = !!d.is_before
+  const row = (await q(`insert into assets (business_id,job_id,customer_id,kind,url,label,is_before)
+      values ($1,$2,$3,$4,$5,$6,$7) returning id, kind, url, label, is_before, created_at`,
+    [b, id, job.customer_id, kind, url, label, isBefore])).rows[0]
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'attachment',$4)`,
+    [b, id, job.customer_id, `Attached ${kind}${label ? ` — ${label}` : ''}`])
+  return c.json({ asset: row })
+})
+app.post('/api/assets/:id/delete', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const r = await q(`delete from assets where id=$1 and business_id=$2`, [id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+
+// ---- CUSTOMERS (Wave 3: profiles + history) — repeat customers become relationships ----
+app.get('/api/customers', auth, async (c) => {
+  const b = biz(c)
+  const search = (c.req.query('q') || '').toString().trim()
+  const params = [b]
+  let where = `c.business_id=$1`
+  if (search) {
+    params.push(`%${search}%`)
+    where += ` and (c.name ilike $${params.length} or c.phone ilike $${params.length} or c.location ilike $${params.length})`
+  }
+  const rows = (await q(`select c.id, c.name, c.phone, c.location, c.source, c.created_at,
+      count(j.id)::int as jobs,
+      coalesce(sum(j.charge) filter (where j.status='paid'),0)::float as total_spent,
+      greatest(c.created_at, coalesce(max(j.created_at), c.created_at)) as last_seen
+    from customers c left join jobs j on j.customer_id=c.id and j.business_id=c.business_id
+    where ${where}
+    group by c.id
+    order by last_seen desc nulls last`, params)).rows
+  return c.json({ customers: rows })
+})
+app.get('/api/customers/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const customer = (await q(`select c.id, c.name, c.phone, c.location, c.email, c.source, c.notes, c.created_at,
+      count(j.id)::int as jobs,
+      coalesce(sum(j.charge) filter (where j.status='paid'),0)::float as total_spent
+    from customers c left join jobs j on j.customer_id=c.id and j.business_id=c.business_id
+    where c.id=$1 and c.business_id=$2 group by c.id`, [id, b])).rows[0]
+  if (!customer) return c.json({ error: 'not found' }, 404)
+  const vehicles = (await q(`select id, year, make, model, vin, is_euro, notes, created_at
+      from vehicles where customer_id=$1 and business_id=$2 order by created_at desc`, [id, b])).rows
+  const jobs = (await q(`select j.id, j.status, j.issue, j.service, j.charge, j.est_value,
+      coalesce(j.charge,0)-coalesce(j.parts_cost,0)-coalesce(j.gas_cost,0) as profit,
+      j.ticket_tier, j.safety_flag, j.created_at, j.scheduled_date, j.paid_at,
+      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from jobs j left join vehicles v on v.id=j.vehicle_id
+    where j.customer_id=$1 and j.business_id=$2 order by j.created_at desc`, [id, b])).rows
+  const activity = (await q(`select a.type, a.body, a.created_at, a.job_id
+      from activity a where a.customer_id=$1 and a.business_id=$2
+         or a.job_id in (select id from jobs where customer_id=$1 and business_id=$2)
+      order by a.created_at desc limit 100`, [id, b])).rows
+  return c.json({ customer, vehicles, jobs, activity })
+})
+
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()

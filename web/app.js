@@ -27,13 +27,13 @@ const I = {
 }
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
 const NAV_GROUPS = [
-  ['Acquire', [['pulse', 'Pulse', I.spark]]],
-  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['quotes', 'Quotes', I.money], ['money', 'Money', I.money]]],
+  ['Acquire', [['pulse', 'Pulse', I.spark], ['triage', 'Triage', I.bolt]]],
+  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['quotes', 'Quotes', I.money], ['customers', 'Customers', I.today], ['money', 'Money', I.money]]],
   ['Grow', [['activation', 'Activation', I.bolt]]],
-  ['Plan', [['backburner', 'Back-burner', I.arrow]]],
+  ['Plan', [['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', pipeline: 'Pipeline', quotes: 'Quotes', money: 'Money', activation: 'Activation', backburner: 'Back-burner' }
+const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', quotes: 'Quotes', customers: 'Customers', money: 'Money', activation: 'Activation', templates: 'Templates', backburner: 'Back-burner' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -77,6 +77,9 @@ async function renderApp(next) {
     else if (tab === 'activation') await viewActivation()
     else if (tab === 'quotes') await viewQuotes()
     else if (tab === 'backburner') await viewBackburner()
+else if (tab === 'triage') await viewTriage()
+else if (tab === 'customers') await viewCustomers()
+else if (tab === 'templates') await viewTemplates()
   } catch (e) { /* 401 handled */ }
 }
 
@@ -312,7 +315,9 @@ async function openJob(id) {
       <div style="display:flex;gap:var(--s2);flex-wrap:wrap">
         ${j.phone ? `<a class="btn ghost sm" href="tel:${esc(j.phone)}">${I.phone} Call</a>` : ''}
         ${j.status !== 'paid' && j.status !== 'lost' ? `<button class="btn ghost sm" id="dadv">${I.arrow} Advance</button>` : ''}
+        <button class="btn ghost sm" id="dreply">Quick reply</button>
         <button class="btn primary sm" id="dquote">Quote</button></div>
+      <div><div class="label" style="margin-bottom:var(--s2)">Files &amp; photos</div><div class="asset-host">Loading…</div></div>
       <div><div class="label" style="margin-bottom:var(--s2)">Activity</div>
         <div class="tl">${(d.activity || []).map((a) => `<div class="tl__i"><span class="dot"></span><div><div class="body">${esc(a.body || a.type)}</div><div class="when">${ago(a.created_at)} ago</div></div></div>`).join('') || '<span style="color:var(--fg4);font-size:12px">No activity yet</span>'}</div></div>
     </div></aside>`
@@ -321,6 +326,8 @@ async function openJob(id) {
   $('.scrim', wrap).onclick = close; $('.drawer__close', wrap).onclick = close
   const adv = $('#dadv', wrap); if (adv) adv.onclick = async () => { await api(`/api/jobs/${id}/advance`, { method: 'POST' }); close(); renderApp() }
   $('#dquote', wrap).onclick = () => { close(); openQuote(j) }
+  const dr = $('#dreply', wrap); if (dr) dr.onclick = () => openQuickReply(j)
+  const ah = $('.asset-host', wrap); if (ah) loadAssets(id, ah)
 }
 
 /* ---------------- QUOTE MODAL ($1k profit floor) ---------------- */
@@ -622,6 +629,260 @@ function bindAttention(scope) {
     b.classList.toggle('on', on)
     await api('/api/attention', { method: 'PUT', body: JSON.stringify({ [k]: on }) })
   }))
+}
+
+/* ===================== WAVE 3 · PULL ENERGY IN ===================== */
+
+/* --- shared: token fill for templates --- */
+function fillTokens(body, ctx) {
+  return String(body || '')
+    .replace(/\{name\}/g, (ctx.name || 'there').trim())
+    .replace(/\{vehicle\}/g, (ctx.vehicle || 'your car').trim())
+    .replace(/\{issue\}/g, (ctx.issue || 'the job').trim())
+}
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text) }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select(); try { document.execCommand('copy') } catch (_) {} ta.remove()
+  }
+  if (btn) { const old = btn.innerHTML; btn.innerHTML = `${I.check} Copied`; btn.classList.add('copied'); setTimeout(() => { btn.innerHTML = old; btn.classList.remove('copied') }, 1400) }
+}
+
+/* ===================== TEMPLATES ===================== */
+const TPL_CATS = ['pricing', 'availability', 'first-contact', 'do-you-do', 'follow-up', 'other']
+async function viewTemplates() {
+  const d = await api('/api/templates'); const items = d.templates || []
+  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn primary" id="tpl-add">${I.plus} New template</button>`; $('#tpl-add').onclick = () => openTemplate() }
+  const groups = {}
+  items.forEach((t) => { const c = t.category || 'other'; (groups[c] = groups[c] || []).push(t) })
+  const order = TPL_CATS.filter((c) => groups[c]).concat(Object.keys(groups).filter((c) => !TPL_CATS.includes(c)))
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} Fast replies</span>
+      <p>Your go-to answers, one tap away. Use {name}, {vehicle} and {issue} — when you fire one from a lead's drawer it fills itself in and copies, ready to paste. Trust and straight answers, never lead with price.</p></div>
+    ${items.length
+      ? order.map((c) => `<div class="sec-h"><span class="label">${esc(c.replace(/-/g, ' '))}</span><span class="ct">${groups[c].length}</span></div><div class="list">${groups[c].map(tplRow).join('')}</div>`).join('')
+      : emptyState('No templates yet', 'Build your common replies once — pricing, availability, "do you do X", first contact, follow-up — then send them in one tap from any lead.')}
+  `)
+  app.querySelectorAll('[data-tpl-copy]').forEach((b) => (b.onclick = () => { const t = items.find((x) => String(x.id) === b.dataset.tplCopy); copyText(t ? t.body : '', b) }))
+  app.querySelectorAll('[data-tpl-edit]').forEach((b) => (b.onclick = () => { const t = items.find((x) => String(x.id) === b.dataset.tplEdit); openTemplate(t) }))
+  app.querySelectorAll('[data-tpl-del]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Delete this template?')) return
+    await api(`/api/templates/${b.dataset.tplDel}`, { method: 'DELETE' }); renderApp('templates')
+  }))
+}
+function tplRow(t) {
+  return `<div class="lrow tpl-row">
+    <div class="grow"><div class="nm">${esc(t.label)}</div><div class="tpl-body">${esc(t.body)}</div></div>
+    <div class="qacts">
+      <button class="btn primary sm" data-tpl-copy="${t.id}">${I.check} Copy</button>
+      <button class="btn ghost sm" data-tpl-edit="${t.id}">Edit</button>
+      <button class="btn ghost sm" data-tpl-del="${t.id}">${I.x}</button>
+    </div>
+  </div>`
+}
+function openTemplate(t) {
+  const editing = !!(t && t.id)
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">${editing ? 'Edit template' : 'New template'}</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Category</label>
+        <select class="input" id="tpl-cat">${TPL_CATS.map((c) => `<option value="${c}" ${(t && t.category) === c ? 'selected' : ''}>${esc(c.replace(/-/g, ' '))}</option>`).join('')}</select></div>
+      <div class="field"><label>Label</label><input class="input" id="tpl-label" placeholder="e.g. Pricing — how it works" value="${esc(t ? t.label : '')}"></div>
+      <div class="field"><label>Message · use {name} {vehicle} {issue}</label>
+        <textarea class="input ta" id="tpl-text" rows="6" placeholder="Hey {name} — happy to take a look at {vehicle}…">${esc(t ? t.body : '')}</textarea></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="tpl-save">${editing ? 'Save changes' : 'Add template'}</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#tpl-save', wrap).onclick = async () => {
+    const label = $('#tpl-label', wrap).value.trim(), body = $('#tpl-text', wrap).value.trim(), category = $('#tpl-cat', wrap).value
+    if (!label || !body) return
+    if (editing) await api(`/api/templates/${t.id}`, { method: 'PUT', body: JSON.stringify({ label, body, category }) })
+    else await api('/api/templates', { method: 'POST', body: JSON.stringify({ label, body, category }) })
+    close(); renderApp('templates')
+  }
+}
+
+/* --- Quick reply picker (fired from the job drawer) --- */
+async function openQuickReply(j) {
+  let d; try { d = await api('/api/templates') } catch (e) { d = { templates: [] } }
+  const items = d.templates || []
+  const ctx = { name: (j.customer || '').split(' ')[0] || j.customer, vehicle: j.vehicle, issue: j.issue || j.service }
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Quick reply · ${esc(j.customer || '')}</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      ${items.length ? `<div class="field"><label>Template</label>
+        <select class="input" id="qr-pick">${items.map((t, i) => `<option value="${i}">${esc((t.category ? t.category.replace(/-/g, ' ') + ' · ' : '') + t.label)}</option>`).join('')}</select></div>
+        <div class="field"><label>Filled for ${esc(j.customer || 'this lead')}</label><textarea class="input ta" id="qr-text" rows="7"></textarea></div>`
+        : `<div class="empty" style="padding:var(--s5) 0"><div class="ttl">No templates yet</div><div class="sub">Add a few in Templates first, then fire them from here in one tap.</div></div>`}
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Close</button>${items.length ? `<button class="btn primary" id="qr-copy">${I.check} Copy reply</button>` : ''}</div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  if (items.length) {
+    const pick = $('#qr-pick', wrap), txt = $('#qr-text', wrap)
+    const sync = () => { txt.value = fillTokens(items[Number(pick.value) || 0].body, ctx) }
+    pick.onchange = sync; sync()
+    $('#qr-copy', wrap).onclick = () => copyText(txt.value, $('#qr-copy', wrap))
+  }
+}
+
+/* ===================== TRIAGE ===================== */
+async function viewTriage() {
+  const d = await api('/api/triage'); const items = d.triage || []; const s = d.summary || {}
+  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn primary" id="addlead">${I.plus} Add lead</button>`; $('#addlead').onclick = openAddLead }
+  setView(`
+    <div class="kpis">
+      <div class="kpi primary"><div class="lab">Open leads</div><div class="val">${s.total || 0}</div><div class="meta">to triage</div></div>
+      <div class="kpi"><div class="lab">High-ticket</div><div class="val">${s.high || 0}</div><div class="meta">work these first</div></div>
+      <div class="kpi ${s.safety ? 'warn' : ''}"><div class="lab">Safety</div><div class="val">${s.safety || 0}</div><div class="meta">flagged urgent</div></div>
+      <div class="kpi ${s.uncontacted ? 'warn' : ''}"><div class="lab">Untouched</div><div class="val">${s.uncontacted || 0}</div><div class="meta">no first contact</div></div>
+    </div>
+    <div class="sec-h"><span class="label">Triage queue · money first</span><span class="ct">${items.length}</span></div>
+    ${items.length ? `<div class="list">${items.map(triageRow).join('')}</div>`
+      : emptyState('Queue is clear', 'No open leads waiting. When inbound comes in, the biggest jobs jump to the top here so your attention goes where the money is.')}
+  `)
+  bindTriage(items)
+}
+function triageRow(j) {
+  const val = j.charge || j.est_value
+  const uncontacted = !j.first_contact_at
+  return `<div class="lrow trow ${j.ticket_tier === 'HIGH' ? 'hi' : ''}">
+    <div class="grow" data-job="${j.id}">
+      <div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''} ${uncontacted ? '<span class="age-tag stale">new</span>' : ''}</div>
+      <div class="sub">${esc([j.vehicle, j.issue || j.service].filter(Boolean).join(' · ') || 'No detail')} · ${ago(j.created_at)} ago</div>
+      ${j.likely_cause ? `<div class="ai-read">${I.spark}<span>${esc(j.likely_cause)}</span></div>` : ''}
+      <div class="qmeta">${tierBadge(j)}${val ? `<span class="age-tag" style="color:var(--fg)">${money(val)}</span>` : ''}</div>
+    </div>
+    <div class="qright">
+      <div class="qacts">
+        ${j.phone ? `<a class="btn primary sm" href="tel:${esc(j.phone)}">${I.phone} Call</a>` : ''}
+        <button class="btn ghost sm" data-tri-reply="${j.id}">Reply</button>
+        <button class="btn ghost sm" data-job="${j.id}">Open</button>
+      </div>
+    </div>
+  </div>`
+}
+function bindTriage(items) {
+  bindRows()
+  app.querySelectorAll('.trow .grow[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  app.querySelectorAll('[data-tri-reply]').forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const j = items.find((x) => String(x.id) === b.dataset.triReply); if (j) openQuickReply(j) }))
+}
+
+/* ===================== ASSETS (inside job drawer) ===================== */
+const ASSET_KINDS = [['photo', 'Photo'], ['clip', 'Clip'], ['quote', 'Quote'], ['invoice', 'Invoice'], ['doc', 'Doc']]
+function assetTile(a) {
+  const isImg = a.kind === 'photo'
+  return `<div class="asset" data-asset="${a.id}">
+    <div class="asset__media ${isImg ? '' : 'doc'}">${isImg ? `<img src="${esc(a.url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">` : `<span class="asset__kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}</div>
+    <div class="asset__meta">
+      <a class="asset__lbl" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.label || a.kind || 'attachment')}</a>
+      <div class="asset__sub">${esc((a.kind || 'doc'))}${a.is_before ? ' · before' : ''} · ${ago(a.created_at)} ago</div>
+    </div>
+    <button class="asset__del" data-asset-del="${a.id}" title="Remove">${I.x}</button>
+  </div>`
+}
+async function loadAssets(jobId, host) {
+  let d; try { d = await api(`/api/jobs/${jobId}/assets`) } catch (e) { d = { assets: [] } }
+  const items = d.assets || []
+  host.innerHTML = `
+    ${items.length ? `<div class="asset-grid">${items.map(assetTile).join('')}</div>` : `<div class="asset-empty">Nothing attached yet — drop the customer's photos, the quote or the invoice so it stops living in your camera roll.</div>`}
+    <div class="asset-add">
+      <div class="field"><label>Paste a link</label><input class="input" id="as-url" placeholder="https://… (photo, drive, PDF)"></div>
+      <div class="asset-add__row">
+        <select class="input" id="as-kind">${ASSET_KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
+        <input class="input" id="as-label" placeholder="Label (e.g. front brakes before)">
+      </div>
+      <label class="as-check"><input type="checkbox" id="as-before"> <span>This is a "before" shot</span></label>
+      <button class="btn primary sm" id="as-save">${I.plus} Attach</button>
+    </div>`
+  host.querySelectorAll('[data-asset-del]').forEach((b) => (b.onclick = async () => {
+    await api(`/api/assets/${b.dataset.assetDel}/delete`, { method: 'POST' }); loadAssets(jobId, host)
+  }))
+  const saveBtn = $('#as-save', host)
+  saveBtn.onclick = async () => {
+    const url = $('#as-url', host).value.trim(); if (!url) return
+    saveBtn.disabled = true
+    await api(`/api/jobs/${jobId}/assets`, { method: 'POST', body: JSON.stringify({ url, kind: $('#as-kind', host).value, label: $('#as-label', host).value.trim() || undefined, is_before: $('#as-before', host).checked }) })
+    loadAssets(jobId, host)
+  }
+}
+
+/* ===================== CUSTOMERS ===================== */
+async function viewCustomers() {
+  const tr = $('.topbar .right'); if (tr) tr.innerHTML = `<input class="input cust-search" id="cust-q" placeholder="Search name, phone, area…" autocomplete="off">`
+  setView(`<div id="cust-wrap"><div class="loading">Loading…</div></div>`)
+  const load = async (q) => {
+    const d = await api('/api/customers' + (q ? '?q=' + encodeURIComponent(q) : '')); const list = d.customers || []
+    $('#cust-wrap').innerHTML = list.length
+      ? `<div class="sec-h"><span class="label">${q ? 'Matches' : 'All customers'}</span><span class="ct">${list.length}</span></div><div class="list">${list.map(custRow).join('')}</div>`
+      : (q ? `<div class="empty" style="padding:var(--s7) 0"><div class="ic">${I.today}</div><div class="ttl">No match for "${esc(q)}"</div><div class="sub">Try a name, phone number, or area.</div></div>`
+           : emptyState('No customers yet', 'Every lead you add becomes a customer here — their cars, their jobs, the whole history. Repeat work starts as a relationship you keep warm.'))
+    $('#cust-wrap').querySelectorAll('[data-cust]').forEach((el) => (el.onclick = () => openCustomer(el.dataset.cust)))
+  }
+  await load('')
+  const inp = $('#cust-q'); if (inp) { let t; inp.oninput = () => { clearTimeout(t); t = setTimeout(() => load(inp.value.trim()), 220) }; inp.focus() }
+}
+function custRow(c) {
+  return `<div class="lrow cust-row" data-cust="${c.id}">
+    <div class="cust-av">${esc((c.name || '?').trim().charAt(0).toUpperCase() || '?')}</div>
+    <div class="grow"><div class="nm">${esc(c.name || 'Unknown')}</div>
+      <div class="sub">${esc([c.phone, c.location].filter(Boolean).join(' · ') || 'No contact detail')}</div></div>
+    <div class="cust-stats">
+      <span class="cs"><b class="num">${c.jobs || 0}</b> job${(c.jobs || 0) === 1 ? '' : 's'}</span>
+      <span class="cs"><b class="num">${money(c.total_spent)}</b> spent</span>
+      <span class="cs cs-last">${c.last_seen ? ago(c.last_seen) + ' ago' : 'new'}</span>
+    </div>
+  </div>`
+}
+async function openCustomer(id) {
+  const d = await api(`/api/customers/${id}`); const c = d.customer || {}; const vehicles = d.vehicles || []; const jobs = d.jobs || []; const activity = d.activity || []
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><aside class="drawer">
+    <div class="drawer__h"><span class="cust-av">${esc((c.name || '?').trim().charAt(0).toUpperCase() || '?')}</span>
+      <div style="min-width:0"><div class="t-h2" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(c.name || 'Unknown')}</div>
+        <div style="color:var(--fg3);font-size:12px">${esc([c.phone, c.location].filter(Boolean).join(' · ') || 'No contact detail')}</div></div>
+      <button class="drawer__close">${I.x}</button></div>
+    <div class="drawer__b">
+      <div class="cust-tally">
+        <div class="co-stat"><div class="v num">${jobs.length}</div><div class="k">Jobs</div></div>
+        <div class="co-stat"><div class="v num" style="color:var(--green)">${money(c.total_spent)}</div><div class="k">Lifetime</div></div>
+        <div class="co-stat"><div class="v num">${vehicles.length}</div><div class="k">Vehicles</div></div>
+      </div>
+      <div style="display:flex;gap:var(--s2);flex-wrap:wrap">
+        ${c.phone ? `<a class="btn primary sm" href="tel:${esc(c.phone)}">${I.phone} Call</a>` : ''}
+        ${c.source ? `<span class="pill lead"><span class="dot"></span>${esc(c.source)}</span>` : ''}
+      </div>
+      ${vehicles.length ? `<div><div class="label" style="margin-bottom:var(--s2)">Vehicles</div><div class="list">${vehicles.map((v) => `
+        <div class="lrow"><div class="grow"><div class="nm">${esc([v.year, v.make, v.model].filter(Boolean).join(' ') || 'Vehicle')} ${v.is_euro ? '<span class="ai-score">euro</span>' : ''}</div>
+          ${v.vin ? `<div class="sub num">${esc(v.vin)}</div>` : ''}</div></div>`).join('')}</div></div>` : ''}
+      <div><div class="label" style="margin-bottom:var(--s2)">Jobs</div>
+        ${jobs.length ? `<div class="list">${jobs.map(custJobRow).join('')}</div>` : '<span style="color:var(--fg4);font-size:12px">No jobs yet</span>'}</div>
+      <div><div class="label" style="margin-bottom:var(--s2)">History</div>
+        <div class="tl">${activity.length ? activity.map((a) => `<div class="tl__i"><span class="dot"></span><div><div class="body">${esc(a.body || a.type)}</div><div class="when">${ago(a.created_at)} ago</div></div></div>`).join('') : '<span style="color:var(--fg4);font-size:12px">No history yet</span>'}</div></div>
+    </div></aside>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close; $('.drawer__close', wrap).onclick = close
+  wrap.querySelectorAll('[data-job]').forEach((el) => (el.onclick = () => { close(); openJob(el.dataset.job) }))
+}
+function custJobRow(j) {
+  const val = j.charge || j.est_value
+  return `<div class="lrow" data-job="${j.id}">
+    <div class="grow"><div class="nm">${esc(j.issue || j.service || 'Job')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+      <div class="sub">${esc([j.vehicle, ago(j.created_at) + ' ago'].filter(Boolean).join(' · '))}</div></div>
+    <span class="pill ${j.status}"><span class="dot"></span>${esc((j.status || '').replace('_', ' '))}</span>
+    <span class="amt">${val ? money(val) : ''}</span>
+  </div>`
 }
 
 if (token) renderApp('pulse'); else renderLogin()
