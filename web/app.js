@@ -28,11 +28,12 @@ const I = {
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
 const NAV_GROUPS = [
   ['Acquire', [['pulse', 'Pulse', I.spark]]],
-  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['money', 'Money', I.money]]],
+  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['quotes', 'Quotes', I.money], ['money', 'Money', I.money]]],
   ['Grow', [['activation', 'Activation', I.bolt]]],
+  ['Plan', [['backburner', 'Back-burner', I.arrow]]],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', pipeline: 'Pipeline', money: 'Money', activation: 'Activation' }
+const TITLE = { pulse: 'Pulse', pipeline: 'Pipeline', quotes: 'Quotes', money: 'Money', activation: 'Activation', backburner: 'Back-burner' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -74,6 +75,8 @@ async function renderApp(next) {
     else if (tab === 'pipeline') await viewPipeline()
     else if (tab === 'money') await viewMoney()
     else if (tab === 'activation') await viewActivation()
+    else if (tab === 'quotes') await viewQuotes()
+    else if (tab === 'backburner') await viewBackburner()
   } catch (e) { /* 401 handled */ }
 }
 
@@ -378,4 +381,247 @@ function openAddLead() {
 }
 
 /* ---------------- boot ---------------- */
+/* ===================== WAVE 2 · STOP THE LEAKS ===================== */
+
+/* --- shared quote/age helpers --- */
+const QUOTE_PILL = { draft: 'lead', sent: 'quoted', accepted: 'scheduled', declined: 'lost' }
+const QUOTE_LABEL = { draft: 'Draft', sent: 'Sent', accepted: 'Accepted', declined: 'Declined' }
+function ageTag(days) {
+  const d = Math.max(0, Math.round(Number(days || 0)))
+  const cls = d >= 3 ? 'age-tag stale' : 'age-tag'
+  const txt = d === 0 ? 'today' : d === 1 ? '1 day' : d + ' days'
+  return `<span class="${cls}">${txt}</span>`
+}
+function profitTag(profit, below) {
+  return `<span class="profit-tag ${below ? 'bad' : 'ok'}">${money(profit)} profit</span>`
+}
+
+/* --- reusable Gone-quiet section (used on Pulse + standalone) --- */
+async function quietSection() {
+  let d
+  try { d = await api('/api/quiet') } catch (e) { return '' }
+  const items = d.quiet || []
+  if (!items.length) return `<div class="needs-clear">Nobody's gone quiet. Everyone's been touched in the last 3 days.</div>`
+  return `<div class="list">${items.map((j) => `
+    <div class="lrow" data-job="${j.id}">
+      <div class="grow"><div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+        <div class="sub">${esc([j.vehicle, j.issue].filter(Boolean).join(' · ') || 'No detail')} · last touch ${j.last_touch ? ago(j.last_touch) + ' ago' : 'never'}</div></div>
+      <span class="pill ${j.status}"><span class="dot"></span>${esc((j.status || '').replace('_', ' '))}</span>
+      ${ageTag(j.quiet_days)}
+    </div>`).join('')}</div>`
+}
+
+/* Inject the Gone-quiet panel + Close-out button into the Pulse after it renders.
+   Additive: we wrap renderApp so existing pulse code is untouched. */
+const _renderApp_w2 = renderApp
+renderApp = async function (next) {
+  await _renderApp_w2(next)
+  if (tab !== 'pulse') return
+  const tr = $('.topbar .right')
+  if (tr && !$('#closeout-btn', tr)) {
+    const btn = document.createElement('button')
+    btn.className = 'btn ghost sm'; btn.id = 'closeout-btn'; btn.innerHTML = `${I.check} Close out`
+    btn.onclick = openCloseout
+    tr.appendChild(btn)
+  }
+  const mp = $('.mini-panels')
+  if (mp && !$('.quiet-panel')) {
+    const panel = document.createElement('div')
+    panel.className = 'panel quiet-panel'
+    panel.innerHTML = `<div class="mini-h">Gone quiet · 3+ days untouched</div><div class="quiet-body">Loading…</div>`
+    mp.appendChild(panel)
+    panel.querySelector('.quiet-body').innerHTML = await quietSection()
+    panel.querySelectorAll('[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  }
+  if (mp && !$('.attn-panel')) {
+    const ap = document.createElement('div'); ap.innerHTML = await attentionPanel()
+    if (ap.firstElementChild) { mp.appendChild(ap.firstElementChild); bindAttention(mp) }
+  }
+}
+
+/* ===================== QUOTES ===================== */
+async function viewQuotes() {
+  const d = await api('/api/quotes'); const quotes = d.quotes || []; const s = d.summary || {}
+  $('.topbar .right').innerHTML = `<button class="btn primary" id="addlead">${I.plus} Add lead</button>`
+  $('#addlead').onclick = openAddLead
+  const follow = quotes.filter((q) => q.needs_follow_up)
+  const live = quotes.filter((q) => !q.needs_follow_up)
+  const sec = (title, rows) => `<div class="sec-h"><span class="label">${title}</span><span class="ct">${rows.length}</span></div>` +
+    (rows.length ? `<div class="list">${rows.map(quoteRow).join('')}</div>` : `<div class="lrow" style="color:var(--fg4);justify-content:center">None right now</div>`)
+  setView(`
+    <div class="kpis">
+      <div class="kpi"><div class="lab">Open quotes</div><div class="val">${s.open || 0}</div><div class="meta">awaiting an answer</div></div>
+      <div class="kpi ${s.needs_follow_up ? 'warn' : ''}"><div class="lab">Needs follow-up</div><div class="val">${s.needs_follow_up || 0}</div><div class="meta">sent 3+ days ago</div></div>
+      <div class="kpi ${s.below_floor ? 'warn' : ''}"><div class="lab">Below floor</div><div class="val">${s.below_floor || 0}</div><div class="meta">under $1,000 profit</div></div>
+      <div class="kpi primary"><div class="lab">Outstanding</div><div class="val">${money(s.outstanding_value)}</div><div class="meta">flat price on the table</div></div>
+    </div>
+    ${quotes.length ? '' : emptyState('No quotes yet', 'Quote a job from its drawer and it lands here — then you can chase it before it goes cold.')}
+    ${follow.length ? sec('Chase these — sent 3+ days ago', follow) : ''}
+    ${live.length ? sec('Live quotes', live) : ''}
+  `)
+  bindQuoteRows()
+}
+function quoteRow(q) {
+  const st = q.quote_status || 'draft'
+  const profit = (q.charge || 0) - (q.parts_cost || 0) - (q.gas_cost || 0)
+  return `<div class="lrow qrow ${q.needs_follow_up ? 'flag' : ''}">
+    <div class="grow" data-job="${q.id}">
+      <div class="nm">${esc(q.customer || 'Unknown')} ${q.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+      <div class="sub">${esc([q.vehicle, q.issue || q.service].filter(Boolean).join(' · ') || 'No detail')}</div>
+      <div class="qmeta">
+        <span class="pill ${QUOTE_PILL[st]}"><span class="dot"></span>${QUOTE_LABEL[st]}</span>
+        ${profitTag(q.profit != null ? q.profit : profit, q.below_floor != null ? q.below_floor : (q.profit != null ? q.profit : profit) < 1000)}
+        ${st === 'sent' || st === 'accepted' || st === 'declined' ? ageTag(q.age_days) : ''}
+      </div>
+    </div>
+    <div class="qright">
+      <span class="amt">${q.charge ? money(q.charge) : '—'}</span>
+      <div class="qacts">
+        ${st !== 'sent' && st !== 'accepted' && st !== 'declined' ? `<button class="btn ghost sm" data-qs="sent" data-id="${q.id}">Mark sent</button>` : ''}
+        ${st !== 'accepted' ? `<button class="btn primary sm" data-qs="accepted" data-id="${q.id}">${I.check} Won</button>` : ''}
+        ${st !== 'declined' ? `<button class="btn ghost sm" data-qs="declined" data-id="${q.id}">Lost</button>` : ''}
+      </div>
+    </div>
+  </div>`
+}
+function bindQuoteRows() {
+  app.querySelectorAll('.qrow .grow[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  app.querySelectorAll('[data-qs]').forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation()
+    await api(`/api/quotes/${b.dataset.id}/status`, { method: 'POST', body: JSON.stringify({ quote_status: b.dataset.qs }) })
+    renderApp('quotes')
+  }))
+}
+
+/* ===================== CLOSEOUT MODAL ===================== */
+async function openCloseout() {
+  const d = await api('/api/closeout'); const t = d.today || {}; const o = d.open || {}
+  const quiet = o.quiet || []; const unpaid = o.unpaid || []; const sched = o.scheduledTomorrow || []
+  const looseOpts = [
+    ...unpaid.map((j) => ({ id: j.id, label: `Collect from ${j.customer || 'Unknown'} · ${money(j.charge || j.est_value)}` })),
+    ...quiet.map((j) => ({ id: j.id, label: `Re-touch ${j.customer || 'Unknown'} · quiet ${j.quiet_days || 0}d` })),
+  ]
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">End-of-day close-out</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="co-tally">
+        <div class="co-stat"><div class="v num">${t.new_leads || 0}</div><div class="k">New leads</div></div>
+        <div class="co-stat"><div class="v num">${t.quotes_sent || 0}</div><div class="k">Quotes sent</div></div>
+        <div class="co-stat"><div class="v num">${t.completed || 0}</div><div class="k">Completed</div></div>
+        <div class="co-stat"><div class="v num">${t.paid_jobs || 0}</div><div class="k">Paid</div></div>
+        <div class="co-stat wide"><div class="v num" style="color:var(--green)">${money(t.collected)}</div><div class="k">Collected today</div></div>
+      </div>
+      <div class="co-open">
+        <div class="co-line"><span>Unpaid jobs</span><b class="num">${unpaid.length}</b></div>
+        <div class="co-line"><span>Gone quiet</span><b class="num">${quiet.length}</b></div>
+        <div class="co-line"><span>Scheduled tomorrow</span><b class="num">${sched.length}</b></div>
+      </div>
+      <div class="field"><label>Roll a loose end into tomorrow</label>
+        <select class="input" id="co-job"><option value="">— nothing to roll —</option>${looseOpts.map((o) => `<option value="${o.id}">${esc(o.label)}</option>`).join('')}</select></div>
+      <div class="field"><label>Task title (optional)</label><input class="input" id="co-task" placeholder="e.g. Call back on the BMW suspension quote"></div>
+      <div class="field"><label>End-of-day note (optional)</label><input class="input" id="co-note" placeholder="What happened today / what's on your mind"></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="co-save">${I.check} Close out the day</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#co-save', wrap).onclick = async () => {
+    const note = $('#co-note', wrap).value.trim()
+    const title = $('#co-task', wrap).value.trim()
+    const jobId = $('#co-job', wrap).value
+    const body = {}
+    if (note) body.note = note
+    if (jobId) body.job_id = Number(jobId)
+    if (title) body.task = { title, job_id: jobId ? Number(jobId) : undefined }
+    await api('/api/closeout', { method: 'POST', body: JSON.stringify(body) })
+    close(); renderApp('pulse')
+  }
+}
+
+/* ===================== BACK-BURNER ===================== */
+async function viewBackburner() {
+  const d = await api('/api/backburner'); const ideas = (d.ideas || []).filter((i) => i.status !== 'dismissed')
+  $('.topbar .right').innerHTML = `<button class="btn primary" id="bb-add">${I.plus} Add idea</button>`
+  $('#bb-add').onclick = openBackburner
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} Parking lot</span>
+      <p>Strategic ideas that shouldn't die — but shouldn't nag you either. They sit here quietly. Promote one to a real task only when you're ready to act on it.</p></div>
+    <div class="sec-h"><span class="label">Ideas</span><span class="ct">${ideas.length}</span></div>
+    ${ideas.length ? `<div class="list">${ideas.map(bbRow).join('')}</div>`
+      : emptyState('Back-burner is empty', 'Drop the big-picture moves here — the euro specialty push, the review flywheel, the tooling buy. Nothing gets lost.')}
+  `)
+  app.querySelectorAll('[data-bb-promote]').forEach((b) => (b.onclick = async () => {
+    await api(`/api/backburner/${b.dataset.bbPromote}/promote`, { method: 'POST', body: JSON.stringify({}) })
+    renderApp('backburner')
+  }))
+  app.querySelectorAll('[data-bb-archive]').forEach((b) => (b.onclick = async () => {
+    await api(`/api/backburner/${b.dataset.bbArchive}/archive`, { method: 'POST' })
+    renderApp('backburner')
+  }))
+}
+function bbRow(it) {
+  return `<div class="lrow bb-row">
+    <div class="grow"><div class="nm">${esc(it.title)}</div>${it.body ? `<div class="sub">${esc(it.body)}</div>` : ''}
+      <div class="sub" style="color:var(--fg4)">parked ${ago(it.created_at)} ago</div></div>
+    <div class="qacts">
+      <button class="btn primary sm" data-bb-promote="${it.id}">${I.arrow} Promote</button>
+      <button class="btn ghost sm" data-bb-archive="${it.id}">Archive</button>
+    </div>
+  </div>`
+}
+function openBackburner() {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">New idea</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Idea</label><input class="input" id="bb-title" placeholder="e.g. Build out the euro-specialist landing pages"></div>
+      <div class="field"><label>Detail (optional)</label><input class="input" id="bb-body" placeholder="Why it matters / first step"></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="bb-save">Park it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#bb-save', wrap).onclick = async () => {
+    const title = $('#bb-title', wrap).value.trim()
+    if (!title) return
+    await api('/api/backburner', { method: 'POST', body: JSON.stringify({ title, body: $('#bb-body', wrap).value.trim() || undefined }) })
+    close(); renderApp('backburner')
+  }
+}
+
+/* ===================== ATTENTION GUARD (settings) ===================== */
+const ATTENTION_ROWS = [
+  ['high_ticket_hot_lead', 'HIGH-TICKET hot lead', 'A big job comes in — interrupt me'],
+  ['one_star_review', '1-star review', 'Reputation hit — interrupt me'],
+  ['quote_accepted', 'Quote accepted', 'A quote turned into a yes'],
+  ['completed_unpaid', 'Job done, unpaid', 'Money on the table'],
+  ['new_lead', 'Any new lead', 'Every inbound — off by default, lives in the brief'],
+]
+async function viewBackburnerSettings() { /* reserved */ }
+async function attentionPanel() {
+  let d
+  try { d = await api('/api/attention') } catch (e) { return '' }
+  return `<div class="panel attn-panel">
+    <div class="mini-h">Attention guard</div>
+    <p style="color:var(--fg3);font-size:12px;margin:calc(-1 * var(--s2)) 0 var(--s3)">What's worth interrupting you for vs. what waits for the daily brief. No pushes wired up yet — this just sets the rule.</p>
+    ${ATTENTION_ROWS.map(([k, label, sub]) => `
+      <div class="attn-row">
+        <div class="grow"><div class="nm">${esc(label)}</div><div class="sub">${esc(sub)}</div></div>
+        <button class="toggle ${d[k] ? 'on' : ''}" data-attn="${k}"><span class="knob"></span></button>
+      </div>`).join('')}
+  </div>`
+}
+function bindAttention(scope) {
+  (scope || app).querySelectorAll('[data-attn]').forEach((b) => (b.onclick = async () => {
+    const k = b.dataset.attn; const on = !b.classList.contains('on')
+    b.classList.toggle('on', on)
+    await api('/api/attention', { method: 'PUT', body: JSON.stringify({ [k]: on }) })
+  }))
+}
+
 if (token) renderApp('pulse'); else renderLogin()

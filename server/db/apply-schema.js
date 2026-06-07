@@ -56,6 +56,15 @@ const MIGRATIONS = [
      on conflict (business_id,key) do nothing`,
   `update jobs set first_contact_at = created_at + interval '14 minutes'
      where business_id=1 and status='paid' and first_contact_at > created_at + interval '1 day'`,
+  `alter table jobs add column if not exists quote_status text`,
+  `alter table jobs add column if not exists quote_sent_at timestamptz`,
+  `update jobs set quote_status = case when status in ('scheduled','in_progress','completed','paid') then 'accepted' when status = 'lost' then 'declined' when status = 'quoted' then 'sent' else 'draft' end where quote_status is null and (charge is not null or status <> 'lead')`,
+  `update jobs set quote_status = 'draft' where quote_status is null`,
+  `update jobs set quote_sent_at = coalesce(quote_sent_at, created_at) where quote_status in ('sent','accepted','declined') and quote_sent_at is null`,
+  `alter type task_kind add value if not exists 'backburner'`,
+  `create index if not exists tasks_kind_status_idx on tasks (business_id, kind, status, created_at)`,
+  `create index if not exists jobs_quote_status_idx on jobs (business_id, quote_status, quote_sent_at)`,
+  `insert into settings (business_id,key,value) values (1,'attention','{"high_ticket_hot_lead":true,"one_star_review":true,"new_lead":false,"quote_accepted":true,"completed_unpaid":false}'::jsonb) on conflict (business_id,key) do nothing`,
 ]
 
 export async function applySchema() {

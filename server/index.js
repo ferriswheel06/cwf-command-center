@@ -311,6 +311,152 @@ app.post('/api/pulse/action', auth, async (c) => {
 app.get('/api/goals', auth, async (c) => c.json(await getJson(biz(c), 'goals', { weekly_leads: 3, weekly_revenue: 1200, posting_cadence: 3 })))
 app.put('/api/goals', auth, async (c) => { await setJson(biz(c), 'goals', await c.req.json().catch(() => ({}))); return c.json({ ok: true }) })
 
+// ---- QUOTES (Wave 2: stop the leaks) — tracked quote object, aging, $1k floor ----
+// quote_status: draft | sent | accepted | declined. Flat amount only — NO tax, ever.
+app.get('/api/quotes', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select ${JOB_COLS}, j.quote_status, j.quote_sent_at,
+      coalesce(j.charge,0)-coalesce(j.parts_cost,0)-coalesce(j.gas_cost,0) as profit,
+      case when j.quote_sent_at is not null then floor(extract(epoch from (now()-j.quote_sent_at))/86400.0)::int else null end as age_days
+    ${JOB_FROM}
+    where j.business_id=$1 and (j.charge is not null or coalesce(j.quote_status,'') <> '')
+      and coalesce(j.quote_status,'draft') <> 'draft'
+    order by (j.quote_status='sent') desc, j.quote_sent_at asc nulls last, j.created_at desc`, [b])).rows
+  const quotes = rows.map((r) => {
+    const profit = Number(r.profit) || 0
+    const needs_follow_up = r.quote_status === 'sent' && r.age_days != null && r.age_days >= 3
+    return { ...r, profit, below_floor: profit < 1000, needs_follow_up }
+  })
+  const summary = {
+    open: quotes.filter((x) => x.quote_status === 'sent').length,
+    needs_follow_up: quotes.filter((x) => x.needs_follow_up).length,
+    below_floor: quotes.filter((x) => x.below_floor && x.quote_status !== 'declined').length,
+    outstanding_value: quotes.filter((x) => x.quote_status === 'sent').reduce((s, x) => s + (Number(x.charge) || 0), 0),
+  }
+  return c.json({ quotes, summary })
+})
+
+// One-tap mark sent / accepted / declined — moves the job + logs to activity
+app.post('/api/quotes/:id/status', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const qs = String(d.quote_status || '')
+  if (!['sent', 'accepted', 'declined'].includes(qs)) return c.json({ error: 'bad quote status' }, 400)
+  const job = (await q(`select status, charge, parts_cost, gas_cost from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  // keep the pipeline status honest with the quote outcome (don't downgrade a job already further along)
+  let jobStatus = job.status
+  if (qs === 'sent' && job.status === 'lead') jobStatus = 'quoted'
+  if (qs === 'accepted' && ['lead', 'quoted'].includes(job.status)) jobStatus = 'scheduled'
+  if (qs === 'declined') jobStatus = 'lost'
+  const stampSent = qs === 'sent'
+  await q(`update jobs set quote_status=$1${stampSent ? ', quote_sent_at=coalesce(quote_sent_at,now())' : ''}, status=$2 where id=$3 and business_id=$4`,
+    [qs, jobStatus, id, b])
+  const profit = (Number(job.charge) || 0) - (Number(job.parts_cost) || 0) - (Number(job.gas_cost) || 0)
+  const label = qs === 'sent' ? `Quote sent — ${Number(job.charge) || 0} · profit ${profit}` : qs === 'accepted' ? 'Quote accepted ✓' : 'Quote declined'
+  await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'quote',$3)`, [b, id, label])
+  return c.json({ quote_status: qs, status: jobStatus, profit, below_floor: profit < 1000 })
+})
+
+// ---- GONE-QUIET detector — anything not moved in 3+ days raises its hand ----
+// leads/quotes/scheduled with no activity row (and no contact) in 3+ days.
+app.get('/api/quiet', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select ${JOB_COLS}, j.quote_status,
+      coalesce((select max(a.created_at) from activity a where a.job_id=j.id), j.created_at) as last_touch,
+      floor(extract(epoch from (now()-coalesce((select max(a.created_at) from activity a where a.job_id=j.id), j.created_at)))/86400.0)::int as quiet_days
+    ${JOB_FROM}
+    where j.business_id=$1 and j.status in ('lead','quoted','scheduled')
+      and coalesce((select max(a.created_at) from activity a where a.job_id=j.id), j.created_at) < now() - interval '3 days'
+    order by last_touch asc`, [b])).rows
+  return c.json({ quiet: rows, count: rows.length })
+})
+
+// ---- END-OF-DAY CLOSEOUT — 60-second wrap. Today tally + still-open + roll a loose end ----
+app.get('/api/closeout', auth, async (c) => {
+  const b = biz(c)
+  const today = (await q(`select
+      count(*) filter (where status='lead' and created_at::date = current_date)::int as new_leads,
+      count(*) filter (where quote_sent_at::date = current_date)::int as quotes_sent,
+      count(*) filter (where status='completed' and updated_at::date = current_date)::int as completed,
+      count(*) filter (where status='paid' and paid_at::date = current_date)::int as paid_jobs,
+      coalesce(sum(charge) filter (where status='paid' and paid_at::date = current_date),0)::float as collected
+    from jobs where business_id=$1`, [b])).rows[0]
+  const openLeads = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status in ('lead','quoted') order by (j.ticket_tier='HIGH') desc, j.created_at desc limit 12`, [b])).rows
+  const unpaid = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.status='completed' order by j.created_at`, [b])).rows
+  const scheduledTomorrow = (await q(`select ${JOB_COLS} ${JOB_FROM}
+      where j.business_id=$1 and j.scheduled_date = current_date + 1 order by j.created_at`, [b])).rows
+  const quietCount = (await q(`select count(*)::int n from jobs j where j.business_id=$1 and j.status in ('lead','quoted','scheduled')
+      and coalesce((select max(a.created_at) from activity a where a.job_id=j.id), j.created_at) < now() - interval '3 days'`, [b])).rows[0].n
+  return c.json({ today, open: { leads: openLeads, unpaid, scheduledTomorrow, quiet: quietCount } })
+})
+
+// Log the closeout + optionally roll a loose end into a task for tomorrow
+app.post('/api/closeout', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const note = (d.note || '').toString().trim()
+  let rolled = null
+  if (d.task && (d.task.title || '').toString().trim()) {
+    const title = d.task.title.toString().trim()
+    const jobId = d.task.job_id ? Number(d.task.job_id) : null
+    const due = d.task.due_at || null
+    rolled = (await q(`insert into tasks (business_id,job_id,kind,title,body,status,due_at)
+        values ($1,$2,'todo',$3,$4,'open',coalesce($5::timestamptz, (current_date + 1)::timestamptz)) returning id`,
+      [b, jobId, title, d.task.body || null, due])).rows[0]
+  }
+  const body = note ? `Day closed out — ${note}` : 'Day closed out'
+  await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'closeout',$3)`, [b, d.job_id || null, body])
+  return c.json({ ok: true, rolled_task_id: rolled ? rolled.id : null })
+})
+
+// ---- BACK-BURNER lane — non-nagging parking lot for strategic ideas (tasks kind=backburner) ----
+app.get('/api/backburner', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select id, title, body, status, created_at, completed_at
+      from tasks where business_id=$1 and kind='backburner' and status <> 'dismissed'
+      order by created_at desc`, [b])).rows
+  return c.json({ ideas: rows })
+})
+app.post('/api/backburner', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const title = (d.title || '').toString().trim()
+  if (!title) return c.json({ error: 'need an idea' }, 400)
+  const row = (await q(`insert into tasks (business_id,kind,title,body,status) values ($1,'backburner',$2,$3,'open') returning id, title, body, status, created_at`,
+    [b, title, d.body || null])).rows[0]
+  return c.json({ idea: row })
+})
+// Promote an idea into a normal actionable task
+app.post('/api/backburner/:id/promote', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const row = (await q(`select id, title from tasks where id=$1 and business_id=$2 and kind='backburner'`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  await q(`update tasks set kind='todo', status='open', due_at=coalesce($1::timestamptz, due_at) where id=$2 and business_id=$3`,
+    [d.due_at || null, id, b])
+  await q(`insert into activity (business_id,type,body) values ($1,'system',$2)`, [b, `Promoted back-burner idea: ${row.title}`])
+  return c.json({ ok: true, id: row.id })
+})
+// Archive an idea (let it rest — status=dismissed)
+app.post('/api/backburner/:id/archive', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const r = await q(`update tasks set status='dismissed', completed_at=now() where id=$1 and business_id=$2 and kind='backburner'`, [id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true })
+})
+
+// ---- ATTENTION GUARD — what's interrupt-worthy vs waits-for-the-brief (settings, no push infra yet) ----
+const ATTENTION_DEF = { high_ticket_hot_lead: true, one_star_review: true, new_lead: false, quote_accepted: true, completed_unpaid: false }
+app.get('/api/attention', auth, async (c) => c.json(await getJson(biz(c), 'attention', ATTENTION_DEF)))
+app.put('/api/attention', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const cur = await getJson(b, 'attention', ATTENTION_DEF)
+  const next = { ...cur }
+  for (const k of Object.keys(ATTENTION_DEF)) if (d[k] !== undefined) next[k] = !!d[k]
+  await setJson(b, 'attention', next)
+  return c.json(next)
+})
+
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
