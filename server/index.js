@@ -4,9 +4,14 @@ import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import jwt from 'jsonwebtoken'
 import pg from 'pg'
+import {
+  S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand,
+  CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+} from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { applySchema } from './db/apply-schema.js'
 
 const { Pool } = pg
@@ -544,8 +549,16 @@ app.post('/api/jobs/:id/assets', auth, async (c) => {
 })
 app.post('/api/assets/:id/delete', auth, async (c) => {
   const id = c.req.param('id'), b = biz(c)
-  const r = await q(`delete from assets where id=$1 and business_id=$2`, [id, b])
-  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  // Phase-1: if it's an R2 asset, best-effort delete the object (+ thumb) before dropping the row.
+  const row = (await q(`select id, storage, r2_key, thumb_key from assets where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  if (row.storage === 'r2' && r2Client()) {
+    for (const k of [row.r2_key, row.thumb_key]) {
+      if (!k) continue
+      try { await r2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET(), Key: k })) } catch (e) { console.error('[r2 delete]', e.message) }
+    }
+  }
+  await q(`delete from assets where id=$1 and business_id=$2`, [id, b])
   return c.json({ ok: true })
 })
 
@@ -810,6 +823,8 @@ app.get('/api/assets', auth, async (c) => {
 
 // ---- CONTENT → LEAD ATTRIBUTION — rank content by leads produced, not likes ----
 const CONTENT_STATUSES = ['idea', 'draft', 'scheduled', 'posted']
+// Phase-2 pipeline (kanban) stages — the editing-bridge lifecycle (see the Content Studio block below).
+const STUDIO_STAGES = ['idea', 'raw', 'editing', 'ready', 'scheduled', 'posted']
 app.get('/api/content', auth, async (c) => {
   const b = biz(c)
   const rows = (await q(`select id, title, channel, status, url, notes,
@@ -826,21 +841,42 @@ app.get('/api/content', auth, async (c) => {
   const winners = rows.filter((r) => (Number(r.leads_attributed) || 0) > 0).slice(0, 10)
   return c.json({ content: rows, summary, winners })
 })
+// Create a piece. Back-compat: logging an already-posted piece (status defaults 'posted', Wave-4).
+// Phase-2: also accepts pipeline_stage, hook, caption, hashtags[], source_note, asset_ids[] (Vault sources).
 app.post('/api/content', auth, async (c) => {
   const b = biz(c), d = await c.req.json().catch(() => ({}))
   const title = (d.title || '').toString().trim()
   if (!title) return c.json({ error: 'need a title' }, 400)
-  const status = CONTENT_STATUSES.includes(d.status) ? d.status : 'posted'
+  // Phase-2 kanban stage. If a stage is given but no explicit status, derive the legacy status from it
+  // so the old leads-attribution view keeps working. If neither is given, default to the Wave-4 'posted'.
+  const stage = STUDIO_STAGES.includes(d.pipeline_stage || d.stage) ? (d.pipeline_stage || d.stage) : null
+  const status = CONTENT_STATUSES.includes(d.status) ? d.status
+    : (stage ? (stage === 'posted' ? 'posted' : stage === 'scheduled' ? 'scheduled' : stage === 'idea' ? 'idea' : 'draft') : 'posted')
+  const pipelineStage = stage || (status === 'posted' ? 'posted' : status === 'scheduled' ? 'scheduled' : status === 'draft' ? 'raw' : 'idea')
   const channel = (d.channel || '').toString().trim() || null
   const url = (d.url || '').toString().trim() || null
   const notes = (d.notes || '').toString().trim() || null
+  const hook = (d.hook || '').toString().trim() || null
+  const caption = (d.caption || '').toString().trim() || null
+  const sourceNote = (d.source_note || d.brief || '').toString().trim() || null
+  const hashtags = Array.isArray(d.hashtags) ? d.hashtags.map((x) => String(x).trim()).filter(Boolean) : []
   // posted_at: explicit, or now() if it's already posted, else null
   const postedAt = d.posted_at || (status === 'posted' ? new Date().toISOString() : null)
   const leads = d.leads_attributed != null ? Math.max(0, Number(d.leads_attributed) || 0) : 0
-  const row = (await q(`insert into content (business_id,title,channel,status,url,notes,posted_at,leads_attributed)
-      values ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8)
-      returning id, title, channel, status, url, notes, leads_attributed, posted_at, created_at`,
-    [b, title, channel, status, url, notes, postedAt, leads])).rows[0]
+  const row = (await q(`insert into content (business_id,title,channel,status,pipeline_stage,url,notes,hook,caption,hashtags,source_note,posted_at,leads_attributed)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::timestamptz,$13)
+      returning id, title, channel, status, pipeline_stage, url, notes, hook, caption, hashtags, source_note, leads_attributed, posted_at, created_at`,
+    [b, title, channel, status, pipelineStage, url, notes, hook, caption, JSON.stringify(hashtags), sourceNote, postedAt, leads])).rows[0]
+  // attach any seed Vault assets as sources (tenant-scoped, order preserved)
+  if (Array.isArray(d.asset_ids) && d.asset_ids.length) {
+    let sort = 0
+    for (const aid of d.asset_ids) {
+      const a = (await q(`select id from assets where id=$1 and business_id=$2`, [Number(aid), b])).rows[0]
+      if (!a) continue
+      await q(`insert into content_assets (business_id,content_id,asset_id,role,sort) values ($1,$2,$3,'source',$4)
+               on conflict (content_id, asset_id, role) do nothing`, [b, row.id, a.id, sort++])
+    }
+  }
   return c.json({ content: row })
 })
 // +1 a lead (delta), or set leads_attributed to an absolute number
@@ -1125,6 +1161,17 @@ const PLAYBOOKS = {
     { title: 'Test it with a real call', detail: 'Call the number yourself and run a real scenario (e.g. a clunk over bumps on a BMW). Check it captures name + number + symptom, gives an honest non-committal read, and offers to patch you in. Fix anything that sounds scripted or off-brand before it goes live.' },
     { title: 'Have Claude Code wire it end-to-end', detail: 'Once your accounts exist, hand off the keys and number — Claude Code loads the prompt, configures the ElevenLabs voice, sets the 647-450-0406 escalation logic, the SMS follow-up, and the missed-call routing, then runs a test-call checklist so you only have to confirm it.', handoff: { kind: 'retell_wire_agent', title: 'Wire the Retell phone agent: load AGENT-PROMPT.md, connect the ElevenLabs voice, set escalation to 647-450-0406, the after-call SMS, missed-call routing, and a test-call checklist' } },
   ],
+  social: [
+    { title: 'Why one-tap posting first (the honest version)', detail: 'Real talk: nobody can skip platform app-review. Self-hosting a posting tool still needs YOUR own approved developer app per platform — that is the wall, and it takes weeks for Instagram/TikTok. So the Studio already does the smart thing: it produces the finished, captioned, correctly-sized post and drops it in Ready, you tap "post now" and it copies the caption + opens the channel. That ships value today with zero API risk. This gate connects the low-friction channels for true auto-post, in friction order.' },
+    { title: 'Connect Google Business Profile posts first (lowest friction)', detail: 'GBP is the easiest win and you are already half set up — your profile is verified and the GBP gate has the post copy. GBP "localPosts" is not deprecated and posting 1-2x a week keeps you ranking. To auto-post you need Google Business Profile API access: request it via the Business Profile APIs form (Basic Access, ~14-day review; profile must be 60+ days old — yours is). Until that lands, keep using one-tap: the Studio copies the caption, you paste it in GBP.', link: 'https://developers.google.com/my-business/content/basic-setup' },
+    { title: 'Connect YouTube next (Shorts auto-upload)', detail: 'YouTube is the easiest real auto-upload. Create/confirm your channel, then in Google Cloud Console enable the "YouTube Data API v3" and create an OAuth client. Quota note (Dec 2025): an upload costs ~100 units against the default ~10,000/day, so ~100 uploads/day free — plenty. Vertical cuts go up as Shorts. This is the first channel worth fully automating.', link: 'https://console.cloud.google.com/apis/library/youtube.googleapis.com' },
+    { title: 'Set expectations on Instagram + TikTok (weeks, not minutes)', detail: 'These are the slow ones — do NOT block posting on them. Instagram (Business/Creator) needs a Meta app with instagram_content_publish, and App Review runs 2-4 weeks; video must be a public URL (R2 already serves that). TikTok unaudited apps can only post privately (SELF_ONLY) — public posting needs a TikTok audit, days to ~2 weeks. Start their approvals the day you commit to daily posting, not before. Until approved, they stay one-tap in the Studio.' },
+    { title: 'Skip the paid aggregators', detail: 'For the record so you do not waste money: Ayrshare free is images-only/20-posts-a-month (useless for video), paid is $149/mo (breaks the $0 rule). Postiz self-host still needs your own Meta/TikTok apps and is a heavy service to babysit for one user. Stay Cloudflare-native + one-tap until you are actually posting 8+ times a day across channels.' },
+    { title: 'Try the assisted post flow now (no setup needed)', detail: 'Open a Ready piece in the Studio, schedule it, then hit "post now" on a channel — it copies the caption to your clipboard and opens that app. Paste, post, paste the post URL back and mark it posted. Then enter the reach + any leads on the post so the Funnel learns which channel actually pays. This works today, before any API.' },
+    { title: 'Hand GBP wiring to Claude Code (when access lands)', detail: 'Once your Google Business Profile API access is approved, hand off the OAuth credentials — Claude Code wires the GBP localPosts auto-post into the Studio so scheduled GBP pieces publish themselves, with the one-tap path kept as the fallback.', handoff: { kind: 'social_wire_gbp', title: 'Wire Google Business Profile auto-post (localPosts API) into the Content Studio: OAuth credentials -> publish scheduled GBP pieces, keep one-tap as fallback, log post URLs back to content_posts' } },
+    { title: 'Hand YouTube wiring to Claude Code (when OAuth is ready)', detail: 'Once the YouTube Data API v3 + OAuth client exist, hand off the credentials — Claude Code wires Shorts auto-upload into the Studio so scheduled YouTube pieces publish the finished cut from R2 and write the video URL back to the post row.', handoff: { kind: 'social_wire_youtube', title: 'Wire YouTube Data API v3 auto-upload (Shorts) into the Content Studio: OAuth client -> upload the R2 cut for scheduled YouTube pieces, write the video URL + status back to content_posts' } },
+    { title: 'Start IG + TikTok approvals last, hand to Claude Code', detail: 'When you commit to daily posting, kick off the multi-week Meta + TikTok app reviews. Hand off the app setup so Claude Code preps the Meta app (instagram_content_publish) and the TikTok app + audit submission, wires both to publish from the R2 public URL once approved, and leaves them in one-tap mode until then.', handoff: { kind: 'social_wire_meta_tiktok', title: 'Prep Instagram (instagram_content_publish, App Review) + TikTok (content posting + audit) apps for the Content Studio: publish from the R2 public URL once approved, keep one-tap mode until approval lands' } },
+  ],
 }
 
 // progress map helper — { gate_key:[doneStepIndexes] }, tenant-scoped via settings
@@ -1225,6 +1272,646 @@ app.post('/api/handoffs/:id/status', auth, async (c) => {
   if (!r.rowCount) return c.json({ error: 'not found' }, 404)
   return c.json({ ok: true, status })
 })
+// ============================================================================
+// CONTENT STUDIO Phase 1 — THE VAULT (Cloudflare R2, private bucket, signed links)
+// Bytes NEVER pass through Railway: the browser uploads DIRECT to R2 over a
+// presigned PUT (single <100MB) or multipart (big GoPro/4K). Previews/downloads
+// are short-lived presigned GETs (bucket is private). If the R2 env vars are
+// missing, the upload endpoints return a clean 503 and the rest of the app is
+// unaffected. Tenant-scoped via biz(c). Paste-a-link stays as a fallback (storage='link').
+// Railway env vars: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET (=cwf-media).
+// ============================================================================
+let _r2 = null
+function r2Client() {
+  const { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET } = process.env
+  if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) return null
+  if (!_r2) {
+    _r2 = new S3Client({
+      region: 'auto',
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+      // R2 rejects the SDK's default flexible-checksums on presigned PUTs (an empty-body CRC32
+      // gets baked into the signed URL → checksum mismatch on the real bytes → 400). Force
+      // checksums off unless explicitly required so presigned PUT/UploadPart URLs sign clean.
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
+    })
+  }
+  return _r2
+}
+const R2_BUCKET = () => process.env.R2_BUCKET
+const r2Down = (c) => c.json({ error: 'storage not configured yet' }, 503)
+const GET_TTL = 3600   // 1h presigned GET — long enough to play/scrub a clip
+const PUT_TTL = 3600   // 1h presigned PUT — covers a slow driveway-LTE upload
+
+const ASSET_KIND_SET = ['photo', 'clip', 'quote', 'invoice', 'doc']
+const safeExt = (filename) => {
+  const m = /\.([a-z0-9]{1,8})$/i.exec((filename || '').toString())
+  return m ? m[1].toLowerCase() : 'bin'
+}
+// key layout: media/{job-id|unsorted}/{uuid}.{ext}
+const buildKey = (jobId, filename) => `media/${jobId ? Number(jobId) : 'unsorted'}/${randomUUID()}.${safeExt(filename)}`
+// fresh short-lived presigned GET for previews/downloads
+const signGet = (key) => getSignedUrl(r2Client(), new GetObjectCommand({ Bucket: R2_BUCKET(), Key: key }), { expiresIn: GET_TTL })
+
+// scope a job to this tenant; returns the job row (id, customer_id) or null
+async function ownedJob(b, jobId) {
+  if (!jobId) return null
+  return (await q(`select id, customer_id from jobs where id=$1 and business_id=$2`, [Number(jobId), b])).rows[0] || null
+}
+
+// ---- single-shot upload: presigned PUT for files under ~100MB ----
+app.post('/api/uploads/sign', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const filename = (d.filename || '').toString().trim()
+  if (!filename) return c.json({ error: 'need a filename' }, 400)
+  const contentType = (d.content_type || '').toString().trim() || 'application/octet-stream'
+  let jobId = null
+  if (d.job_id) { const job = await ownedJob(b, d.job_id); if (!job) return c.json({ error: 'job not found' }, 404); jobId = job.id }
+  const key = buildKey(jobId, filename)
+  const url = await getSignedUrl(r2Client(),
+    new PutObjectCommand({ Bucket: R2_BUCKET(), Key: key, ContentType: contentType }),
+    { expiresIn: PUT_TTL })
+  return c.json({ url, r2_key: key, content_type: contentType, expires_in: PUT_TTL })
+})
+
+// ---- multipart upload (big GoPro/iPhone 4K): create → sign each part → complete/abort ----
+app.post('/api/uploads/multipart/create', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const filename = (d.filename || '').toString().trim()
+  if (!filename) return c.json({ error: 'need a filename' }, 400)
+  const contentType = (d.content_type || '').toString().trim() || 'application/octet-stream'
+  let jobId = null
+  if (d.job_id) { const job = await ownedJob(b, d.job_id); if (!job) return c.json({ error: 'job not found' }, 404); jobId = job.id }
+  const key = buildKey(jobId, filename)
+  const out = await r2Client().send(new CreateMultipartUploadCommand({ Bucket: R2_BUCKET(), Key: key, ContentType: contentType }))
+  return c.json({ uploadId: out.UploadId, r2_key: key, content_type: contentType })
+})
+app.post('/api/uploads/multipart/sign', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const d = await c.req.json().catch(() => ({}))
+  const key = (d.r2_key || '').toString().trim()
+  const uploadId = (d.uploadId || '').toString().trim()
+  const partNumber = Number(d.partNumber)
+  if (!key || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) return c.json({ error: 'need r2_key, uploadId and a valid partNumber (1-10000)' }, 400)
+  const url = await getSignedUrl(r2Client(),
+    new UploadPartCommand({ Bucket: R2_BUCKET(), Key: key, UploadId: uploadId, PartNumber: partNumber }),
+    { expiresIn: PUT_TTL })
+  return c.json({ url, partNumber, expires_in: PUT_TTL })
+})
+app.post('/api/uploads/multipart/complete', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const d = await c.req.json().catch(() => ({}))
+  const key = (d.r2_key || '').toString().trim()
+  const uploadId = (d.uploadId || '').toString().trim()
+  const parts = Array.isArray(d.parts) ? d.parts : []
+  if (!key || !uploadId || !parts.length) return c.json({ error: 'need r2_key, uploadId and parts[]' }, 400)
+  const Parts = parts
+    .map((p) => ({ PartNumber: Number(p.PartNumber), ETag: (p.ETag || '').toString() }))
+    .filter((p) => Number.isInteger(p.PartNumber) && p.ETag)
+    .sort((a, z) => a.PartNumber - z.PartNumber)
+  if (!Parts.length) return c.json({ error: 'parts need PartNumber + ETag' }, 400)
+  const out = await r2Client().send(new CompleteMultipartUploadCommand({
+    Bucket: R2_BUCKET(), Key: key, UploadId: uploadId, MultipartUpload: { Parts },
+  }))
+  return c.json({ ok: true, r2_key: key, location: out.Location || null })
+})
+app.post('/api/uploads/multipart/abort', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const d = await c.req.json().catch(() => ({}))
+  const key = (d.r2_key || '').toString().trim()
+  const uploadId = (d.uploadId || '').toString().trim()
+  if (!key || !uploadId) return c.json({ error: 'need r2_key and uploadId' }, 400)
+  try { await r2Client().send(new AbortMultipartUploadCommand({ Bucket: R2_BUCKET(), Key: key, UploadId: uploadId })) }
+  catch (e) { return c.json({ ok: false, error: e.message }, 200) } // best-effort cleanup, never block the UI
+  return c.json({ ok: true })
+})
+
+// ---- record the uploaded object as a Vault asset (storage='r2') ----
+// Call this AFTER the browser finished the direct-to-R2 PUT (single or multipart complete).
+app.post('/api/uploads/record', auth, async (c) => {
+  if (!r2Client()) return r2Down(c)
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const key = (d.r2_key || '').toString().trim()
+  if (!key) return c.json({ error: 'need r2_key' }, 400)
+  const kind = ASSET_KIND_SET.includes(d.kind) ? d.kind : 'photo'
+  let jobId = null, customerId = null
+  if (d.job_id) { const job = await ownedJob(b, d.job_id); if (!job) return c.json({ error: 'job not found' }, 404); jobId = job.id; customerId = job.customer_id }
+  const mime = (d.mime || '').toString().trim() || null
+  const bytes = d.bytes != null ? Math.max(0, Number(d.bytes) || 0) : null
+  const durationS = d.duration_s != null ? Math.max(0, Math.round(Number(d.duration_s) || 0)) : null
+  const label = (d.label || d.filename || '').toString().trim() || null
+  const isBefore = !!d.is_before
+  // url stays NOT NULL on the table — store the r2_key as the canonical url (private; real access is the signed GET)
+  const row = (await q(`insert into assets (business_id,job_id,customer_id,kind,url,label,is_before,storage,r2_key,mime,bytes,duration_s,status)
+      values ($1,$2,$3,$4,$5,$6,$7,'r2',$8,$9,$10,$11,'ready')
+      returning id, kind, label, is_before, storage, r2_key, mime, bytes, duration_s, status, created_at`,
+    [b, jobId, customerId, kind, key, label, isBefore, key, mime, bytes, durationS])).rows[0]
+  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'attachment',$4)`,
+    [b, jobId, customerId, `Uploaded ${kind}${label ? ` — ${label}` : ''}`])
+  const preview_url = await signGet(key)
+  return c.json({ asset: { ...row, preview_url } })
+})
+
+// ---- THE VAULT — list assets (r2 + link), newest first, fresh signed GET per r2 asset ----
+// Filters: ?kind= &q= (label/service/ai_caption/tags) &job_id=
+app.get('/api/vault', auth, async (c) => {
+  const b = biz(c)
+  const kind = (c.req.query('kind') || '').toString().trim()
+  const search = (c.req.query('q') || '').toString().trim()
+  const jobId = (c.req.query('job_id') || '').toString().trim()
+  const params = [b]
+  let where = `a.business_id=$1`
+  if (kind && ASSET_KIND_SET.includes(kind)) { params.push(kind); where += ` and a.kind=$${params.length}` }
+  if (jobId && /^\d+$/.test(jobId)) { params.push(Number(jobId)); where += ` and a.job_id=$${params.length}` }
+  if (search) {
+    params.push(`%${search}%`)
+    where += ` and (coalesce(a.label,'') ilike $${params.length} or coalesce(a.service,'') ilike $${params.length}
+      or coalesce(a.ai_caption,'') ilike $${params.length} or coalesce(a.tags::text,'') ilike $${params.length})`
+  }
+  const rows = (await q(`select a.id, a.kind, a.url, a.label, a.is_before, a.created_at,
+      a.storage, a.r2_key, a.mime, a.bytes, a.duration_s, a.thumb_key, a.status,
+      a.tags, a.vehicle_id, a.service, a.rating, a.ai_caption,
+      a.job_id, a.customer_id,
+      cu.name as customer,
+      j.status as job_status, j.issue, j.ticket_tier,
+      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from assets a
+    left join jobs j on j.id=a.job_id and j.business_id=a.business_id
+    left join customers cu on cu.id=a.customer_id and cu.business_id=a.business_id
+    left join vehicles v on v.id=coalesce(a.vehicle_id, j.vehicle_id)
+    where ${where}
+    order by a.created_at desc`, params)).rows
+  const haveR2 = !!r2Client()
+  const assets = []
+  for (const r of rows) {
+    let preview_url = null, thumb_url = null
+    if (r.storage === 'r2' && haveR2) {
+      if (r.r2_key) preview_url = await signGet(r.r2_key)
+      thumb_url = r.thumb_key ? await signGet(r.thumb_key) : preview_url
+    } else if (r.storage !== 'r2') {
+      preview_url = r.url   // paste-a-link assets resolve straight to the pasted URL
+      thumb_url = r.url
+    }
+    assets.push({ ...r, preview_url, thumb_url })
+  }
+  const counts = (await q(`select kind, count(*)::int n from assets where business_id=$1 group by kind`, [b])).rows
+  const by_kind = {}
+  for (const r of counts) by_kind[r.kind] = r.n
+  return c.json({ assets, total: assets.length, by_kind, storage_configured: haveR2 })
+})
+
+// ---- fresh presigned GET for opening/downloading the full asset ----
+app.get('/api/assets/:id/url', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const row = (await q(`select id, storage, r2_key, url, mime from assets where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  if (row.storage !== 'r2') return c.json({ url: row.url, storage: row.storage })   // link assets: the pasted URL is the URL
+  if (!r2Client()) return r2Down(c)
+  if (!row.r2_key) return c.json({ error: 'asset has no r2 key' }, 409)
+  const url = await signGet(row.r2_key)
+  return c.json({ url, storage: 'r2', mime: row.mime || null, expires_in: GET_TTL })
+})
+
+// (Asset delete with R2 cleanup is handled by the upgraded POST /api/assets/:id/delete above.)
+
+// ============================================================================
+// CONTENT STUDIO Phase 2 — THE PIPELINE + the Claude-Code editing bridge.
+// Raw footage -> pipeline pieces -> a finished, captioned post. Moving a piece
+// into 'editing' (with source clips attached) auto-fires a 'content_edit' handoff
+// carrying the clips' R2 keys + the brief; Claude Code pulls them, cuts with ffmpeg,
+// uploads the result, and calls /edited to link it back + advance to 'ready'.
+// Free AI (captions/hooks/hashtags) goes through the Cloudflare crm-api Worker —
+// NEVER a paid LLM. If the Worker is unreachable, endpoints degrade gracefully.
+// Tenant-scoped via biz(c). Flat price, no tax, trust>price, no dealers.
+// ============================================================================
+const PIPELINE_STAGES = STUDIO_STAGES   // the kanban lifecycle (declared up by the content routes)
+const AI_WORKER_URL = process.env.AI_WORKER_URL || 'https://api.carswithfares.ca/triage'
+
+// Call the FREE Workers-AI advisor over HTTPS (the /triage contract: {messages}->{reply}).
+// Returns the reply string, or '' if the worker is unreachable/erroring (callers degrade).
+async function askWorker(messages, ms = 12000) {
+  try {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), ms)
+    const res = await fetch(AI_WORKER_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages }),
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(t))
+    if (!res.ok) return ''
+    const j = await res.json().catch(() => ({}))
+    return (j && typeof j.reply === 'string') ? j.reply.trim() : ''
+  } catch (e) { console.error('[ai worker]', e.message); return '' }
+}
+
+// load a piece's attached source assets (with fresh signed thumbs where it's an r2 clip)
+async function pieceAssets(b, contentId, withSigned = true) {
+  const rows = (await q(`select a.id, a.kind, a.url, a.label, a.is_before, a.storage, a.r2_key,
+      a.thumb_key, a.mime, a.bytes, a.duration_s, a.status, ca.role, ca.sort
+    from content_assets ca
+    join assets a on a.id=ca.asset_id and a.business_id=ca.business_id
+    where ca.business_id=$1 and ca.content_id=$2
+    order by ca.sort asc, ca.id asc`, [b, contentId])).rows
+  const haveR2 = withSigned && !!r2Client()
+  const out = []
+  for (const r of rows) {
+    let thumb_url = null
+    if (r.storage === 'r2' && haveR2) thumb_url = r.thumb_key ? await signGet(r.thumb_key) : (r.r2_key ? await signGet(r.r2_key) : null)
+    else if (r.storage !== 'r2') thumb_url = r.url
+    out.push({ ...r, thumb_url })
+  }
+  return out
+}
+
+// ---- THE PIPELINE — content grouped by pipeline_stage (the kanban), each with sources + handoff status ----
+app.get('/api/pipeline', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select co.id, co.title, co.channel, co.status,
+      coalesce(co.pipeline_stage,'idea') as pipeline_stage,
+      co.caption, co.hook, co.hashtags, co.scheduled_for, co.source_note,
+      co.edited_asset_id, coalesce(co.leads_attributed,0)::int as leads_attributed,
+      co.url, co.posted_at, co.created_at,
+      ea.r2_key as edited_r2_key, ea.thumb_key as edited_thumb_key, ea.storage as edited_storage, ea.url as edited_url,
+      h.id as handoff_id, h.status as handoff_status,
+      (select count(*)::int from content_assets ca where ca.content_id=co.id and ca.business_id=co.business_id) as source_count
+    from content co
+    left join assets ea on ea.id=co.edited_asset_id and ea.business_id=co.business_id
+    left join handoffs h on h.business_id=co.business_id and h.kind='content_edit'
+      and h.payload->>'content_id' = co.id::text
+      and h.id = (select max(h2.id) from handoffs h2 where h2.business_id=co.business_id and h2.kind='content_edit' and h2.payload->>'content_id' = co.id::text)
+    where co.business_id=$1
+    order by co.created_at desc`, [b])).rows
+  const haveR2 = !!r2Client()
+  // Phase 3: per-channel posting rows ride along so the drawer can schedule + post without a refetch
+  const postRows = (await q(`select content_id, channel, status, external_url, posted_at, reach, leads
+      from content_posts where business_id=$1 order by id`, [b])).rows
+  const postsByPiece = {}
+  for (const pr of postRows) { (postsByPiece[pr.content_id] = postsByPiece[pr.content_id] || []).push(pr) }
+  const stages = {}
+  for (const s of PIPELINE_STAGES) stages[s] = []
+  for (const r of rows) {
+    const assets = await pieceAssets(b, r.id)
+    let edited_url = null
+    if (r.edited_asset_id) {
+      if (r.edited_storage === 'r2' && haveR2) edited_url = r.edited_thumb_key ? await signGet(r.edited_thumb_key) : (r.edited_r2_key ? await signGet(r.edited_r2_key) : null)
+      else if (r.edited_storage && r.edited_storage !== 'r2') edited_url = r.edited_url
+    }
+    const stage = PIPELINE_STAGES.includes(r.pipeline_stage) ? r.pipeline_stage : 'idea'
+    stages[stage].push({ ...r, assets, edited_url, posts: postsByPiece[r.id] || [] })
+  }
+  const counts = {}
+  for (const s of PIPELINE_STAGES) counts[s] = stages[s].length
+  return c.json({ stages, order: PIPELINE_STAGES, counts, storage_configured: haveR2 })
+})
+
+// (Creating a piece is handled by the upgraded POST /api/content above — it now also
+//  accepts pipeline_stage, hook, caption, hashtags, source_note, and asset_ids[].)
+
+// ---- move a piece between stages; moving->'editing' WITH sources auto-fires a content_edit handoff ----
+app.post('/api/content/:id/stage', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const stage = (d.stage || '').toString().trim()
+  if (!PIPELINE_STAGES.includes(stage)) return c.json({ error: 'bad stage' }, 400)
+  const piece = (await q(`select id, title, channel, hook, caption, source_note from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const legacyStatus = stage === 'posted' ? 'posted' : stage === 'scheduled' ? 'scheduled' : stage === 'idea' ? 'idea' : 'draft'
+  await q(`update content set pipeline_stage=$1, status=$2${stage === 'posted' ? ', posted_at=coalesce(posted_at,now())' : ''} where id=$3 and business_id=$4`,
+    [stage, legacyStatus, id, b])
+  await q(`insert into activity (business_id,type,body) values ($1,'content',$2)`, [b, `"${piece.title}" → ${stage}`])
+
+  let handoff = null
+  if (stage === 'editing') {
+    const sources = await pieceAssets(b, id, false)
+    const asset_keys = sources.filter((s) => s.storage === 'r2' && s.r2_key).map((s) => s.r2_key)
+    if (asset_keys.length) {
+      // don't double-fire if there's already an open content_edit handoff for this piece
+      const existing = (await q(`select id, status from handoffs where business_id=$1 and kind='content_edit'
+          and payload->>'content_id'=$2::text and status<>'done' order by id desc limit 1`, [b, id])).rows[0]
+      if (!existing) {
+        const channel = piece.channel || 'reel'
+        const brief = piece.source_note || piece.hook || `Cut "${piece.title}" into a ${channel} post in Fares' voice — trust>price, "we come to you", the "$X -> $Y" angle. Burn captions, 9:16, vertical, under 30s, end on the soft CTA.`
+        const payload = { content_id: Number(id), asset_keys, brief, channel }
+        const row = (await q(`insert into handoffs (business_id,kind,title,payload,status)
+            values ($1,'content_edit',$2,$3::jsonb,'new')
+            returning id, kind, title, payload, status, created_at`,
+          [b, `Edit "${piece.title}" into a ${channel} post`, JSON.stringify(payload)])).rows[0]
+        await q(`insert into activity (business_id,type,body) values ($1,'handoff',$2)`,
+          [b, `Dispatched to Claude Code: edit "${piece.title}" (${asset_keys.length} clip${asset_keys.length === 1 ? '' : 's'})`])
+        handoff = row
+      } else handoff = existing
+    }
+  }
+  return c.json({ ok: true, pipeline_stage: stage, handoff })
+})
+
+// ---- attach Vault assets as sources for a piece ----
+app.post('/api/content/:id/assets', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const ids = Array.isArray(d.asset_ids) ? d.asset_ids : (d.asset_id != null ? [d.asset_id] : [])
+  if (!ids.length) return c.json({ error: 'need asset_ids[]' }, 400)
+  const role = (d.role || 'source').toString().trim() || 'source'
+  // start sort after the current max so new attaches keep order
+  const maxSort = (await q(`select coalesce(max(sort),-1)::int as m from content_assets where business_id=$1 and content_id=$2`, [b, id])).rows[0].m
+  let sort = maxSort + 1, attached = 0
+  for (const aid of ids) {
+    const a = (await q(`select id from assets where id=$1 and business_id=$2`, [Number(aid), b])).rows[0]
+    if (!a) continue
+    const r = await q(`insert into content_assets (business_id,content_id,asset_id,role,sort) values ($1,$2,$3,$4,$5)
+                       on conflict (content_id, asset_id, role) do nothing`, [b, id, a.id, role, sort++])
+    if (r.rowCount) attached++
+  }
+  const assets = await pieceAssets(b, id)
+  return c.json({ ok: true, attached, assets })
+})
+
+// ---- detach a source asset from a piece ----
+app.delete('/api/content/:id/assets/:assetId', auth, async (c) => {
+  const id = c.req.param('id'), assetId = c.req.param('assetId'), b = biz(c)
+  const piece = (await q(`select id from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const r = await q(`delete from content_assets where business_id=$1 and content_id=$2 and asset_id=$3`, [b, id, assetId])
+  if (!r.rowCount) return c.json({ error: 'not attached' }, 404)
+  const assets = await pieceAssets(b, id)
+  return c.json({ ok: true, assets })
+})
+
+// ---- AI: draft caption + hook + hashtags in Fares' voice (FREE Workers-AI). Degrades gracefully. ----
+app.post('/api/content/:id/caption', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id, title, channel, hook, source_note from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  // gather context: piece title/angle + the source clips' captions/labels
+  const sources = await pieceAssets(b, id, false)
+  const clipNotes = sources.map((s) => s.label || s.kind).filter(Boolean).slice(0, 6).join(', ')
+  const channel = (d.channel || piece.channel || 'instagram').toString().trim()
+  const angle = (d.brief || piece.source_note || piece.hook || piece.title || '').toString().trim()
+  const ask = `Write a ${channel} post for Cars With Fares, the trusted mobile mechanic in Mississauga & the GTA — "we come to you", trust over price, the honest "shop said $X, I did $Y at your door" angle (no exact prices, never "beat your quote", no dealer talk).
+Job/footage: ${piece.title}${clipNotes ? ` (clips: ${clipNotes})` : ''}${angle ? `\nAngle: ${angle}` : ''}.
+Reply ONLY as strict JSON, no markdown, exactly: {"hook":"<scroll-stopping first line>","caption":"<2-4 punchy sentences in Fares' voice, ends on a soft come-to-you CTA>","hashtags":["#tag", ...]}  (5-8 lowercase hashtags, GTA + automotive).`
+  const reply = await askWorker([{ role: 'user', content: ask }])
+  let parsed = null
+  if (reply) {
+    try {
+      const m = reply.match(/\{[\s\S]*\}/)
+      if (m) parsed = JSON.parse(m[0])
+    } catch { parsed = null }
+  }
+  if (!parsed) {
+    // graceful empty so the UI degrades — never 500 the editor
+    return c.json({ ok: true, drafted: false, hook: null, caption: null, hashtags: [], note: 'AI is busy — type it yourself or try again.' })
+  }
+  const hook = (parsed.hook || '').toString().trim() || null
+  const caption = (parsed.caption || '').toString().trim() || null
+  const hashtags = Array.isArray(parsed.hashtags) ? parsed.hashtags.map((x) => String(x).trim()).filter(Boolean).slice(0, 8) : []
+  if (d.save !== false) {
+    await q(`update content set hook=coalesce($1,hook), caption=coalesce($2,caption), hashtags=$3::jsonb where id=$4 and business_id=$5`,
+      [hook, caption, JSON.stringify(hashtags), id, b])
+  }
+  return c.json({ ok: true, drafted: true, hook, caption, hashtags })
+})
+
+// ---- Claude Code calls this after editing: link the finished cut + advance to 'ready' ----
+app.post('/api/content/:id/edited', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id, title from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const assetId = Number(d.asset_id)
+  if (!Number.isInteger(assetId)) return c.json({ error: 'need asset_id' }, 400)
+  const asset = (await q(`select id from assets where id=$1 and business_id=$2`, [assetId, b])).rows[0]
+  if (!asset) return c.json({ error: 'asset not found' }, 404)
+  await q(`update content set edited_asset_id=$1, pipeline_stage='ready', status='draft' where id=$2 and business_id=$3`, [assetId, id, b])
+  // mark the open content_edit handoff done if there is one
+  const h = (await q(`select id from handoffs where business_id=$1 and kind='content_edit'
+      and payload->>'content_id'=$2::text and status<>'done' order by id desc limit 1`, [b, id])).rows[0]
+  if (h) await q(`update handoffs set status='done', result=$1, done_at=now() where id=$2 and business_id=$3`,
+    [(d.result || 'Edited cut linked').toString(), h.id, b])
+  await q(`insert into activity (business_id,type,body) values ($1,'content',$2)`, [b, `Claude Code finished the edit for "${piece.title}" → Ready`])
+  return c.json({ ok: true, pipeline_stage: 'ready', edited_asset_id: assetId, handoff_done: h ? h.id : null })
+})
+
+// ============================================================================
+// CONTENT STUDIO Phase 3 — SCHEDULING + ASSISTED POSTING + THE FUNNEL.
+// Honest posting: NOT full IG/TikTok auto-posting (weeks of platform app review).
+// Instead: schedule a piece -> a 'planned' content_posts row per channel -> a
+// "post now" flow that copies the caption, opens the channel, and you mark it
+// posted -> per-channel reach/leads tracking that powers the funnel. The 'social'
+// activation gate (PLAYBOOKS.social) walks connecting YouTube + GBP first (lowest
+// friction), API auto-post as the gated future. content_posts is the spine: one
+// piece -> many channel posts -> reach -> leads -> (booked/revenue where attributable).
+// Tenant-scoped via biz(c). Flat price, no tax, trust>price, $0 AI, no dealers.
+// ============================================================================
+const POST_CHANNELS = ['instagram', 'tiktok', 'youtube', 'gbp', 'facebook', 'reel']
+const normChannels = (arr) => {
+  const seen = new Set(), out = []
+  for (const x of Array.isArray(arr) ? arr : []) {
+    const ch = String(x || '').trim().toLowerCase()
+    if (ch && POST_CHANNELS.includes(ch) && !seen.has(ch)) { seen.add(ch); out.push(ch) }
+  }
+  return out
+}
+
+// ---- schedule a piece: set scheduled_for, move to 'scheduled', upsert a planned post per channel ----
+app.post('/api/content/:id/schedule', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id, title, channel from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const when = (d.scheduled_for || '').toString().trim()
+  if (!when || isNaN(new Date(when).getTime())) return c.json({ error: 'need a valid scheduled_for' }, 400)
+  // channels: explicit list, else the piece's own channel, else nothing planned (still schedules the piece)
+  let channels = normChannels(d.channels)
+  if (!channels.length && piece.channel) channels = normChannels([piece.channel])
+  await q(`update content set scheduled_for=$1::timestamptz, pipeline_stage='scheduled', status='scheduled'
+           where id=$2 and business_id=$3`, [when, id, b])
+  // upsert a 'planned' content_posts row per channel (don't clobber one already posted)
+  for (const ch of channels) {
+    await q(`insert into content_posts (business_id,content_id,channel,status)
+             values ($1,$2,$3,'planned')
+             on conflict (content_id, channel) do update
+               set status = case when content_posts.status='posted' then content_posts.status else 'planned' end`,
+      [b, id, ch])
+  }
+  const when_h = new Date(when).toLocaleString('en-CA', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  await q(`insert into activity (business_id,type,body) values ($1,'content',$2)`,
+    [b, `Scheduled "${piece.title}" → ${when_h}${channels.length ? ` on ${channels.join(', ')}` : ''}`])
+  const posts = (await q(`select id, channel, status, external_url, posted_at, reach, leads
+      from content_posts where business_id=$1 and content_id=$2 order by id`, [b, id])).rows
+  return c.json({ ok: true, pipeline_stage: 'scheduled', scheduled_for: when, channels, posts })
+})
+
+// ---- mark a channel posted (assisted flow): flips its row 'posted'; all-posted advances the piece ----
+app.post('/api/content/:id/post', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id, title from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const channel = String(d.channel || '').trim().toLowerCase()
+  if (!POST_CHANNELS.includes(channel)) return c.json({ error: 'bad channel' }, 400)
+  const externalUrl = (d.external_url || '').toString().trim() || null
+  // upsert the channel's post row to 'posted' (handles posting a channel that was never planned)
+  await q(`insert into content_posts (business_id,content_id,channel,status,external_url,posted_at)
+           values ($1,$2,$3,'posted',$4,now())
+           on conflict (content_id, channel) do update
+             set status='posted', posted_at=coalesce(content_posts.posted_at,now()),
+                 external_url=coalesce($4, content_posts.external_url)`,
+    [b, id, channel, externalUrl])
+  // when every planned/posted row for this piece is posted, advance the piece to 'posted'
+  const tally = (await q(`select count(*)::int as total, count(*) filter (where status='posted')::int as posted
+      from content_posts where business_id=$1 and content_id=$2`, [b, id])).rows[0]
+  const allPosted = tally.total > 0 && tally.posted === tally.total
+  if (allPosted) {
+    await q(`update content set pipeline_stage='posted', status='posted', posted_at=coalesce(posted_at,now())
+             where id=$1 and business_id=$2`, [id, b])
+  }
+  await q(`insert into activity (business_id,type,body) values ($1,'content',$2)`,
+    [b, `Posted "${piece.title}" on ${channel}${allPosted ? ' — piece is now live' : ` (${tally.posted}/${tally.total} channels)`}`])
+  const posts = (await q(`select id, channel, status, external_url, posted_at, reach, leads
+      from content_posts where business_id=$1 and content_id=$2 order by id`, [b, id])).rows
+  return c.json({ ok: true, channel, all_posted: allPosted, pipeline_stage: allPosted ? 'posted' : 'scheduled', posts })
+})
+
+// ---- manual per-channel metrics (reach / leads) — the funnel reads these ----
+app.post('/api/content/:id/metrics', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const piece = (await q(`select id, title from content where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!piece) return c.json({ error: 'not found' }, 404)
+  const channel = String(d.channel || '').trim().toLowerCase()
+  if (!POST_CHANNELS.includes(channel)) return c.json({ error: 'bad channel' }, 400)
+  const reach = d.reach != null ? Math.max(0, Math.round(Number(d.reach) || 0)) : null
+  const leads = d.leads != null ? Math.max(0, Math.round(Number(d.leads) || 0)) : null
+  if (reach == null && leads == null) return c.json({ error: 'need reach or leads' }, 400)
+  // ensure the row exists (metrics can land before a manual "post now"), then patch only what's given
+  await q(`insert into content_posts (business_id,content_id,channel,status) values ($1,$2,$3,'planned')
+           on conflict (content_id, channel) do nothing`, [b, id, channel])
+  await q(`update content_posts set reach=coalesce($1,reach), leads=coalesce($2,leads)
+           where business_id=$3 and content_id=$4 and channel=$5`, [reach, leads, b, id, channel])
+  const row = (await q(`select id, channel, status, reach, leads from content_posts
+      where business_id=$1 and content_id=$2 and channel=$3`, [b, id, channel])).rows[0]
+  return c.json({ ok: true, post: row })
+})
+
+// ---- CONTENT CALENDAR — scheduled pieces grouped by day, for the Calendar's Content toggle ----
+// Same window contract as /api/calendar (?from= &days=). Each day: pieces with title,
+// channel(s), stage, and a signed thumb of the edited cut (or first source) for the chip.
+app.get('/api/calendar/content', auth, async (c) => {
+  const b = biz(c)
+  const fromRaw = (c.req.query('from') || '').toString().trim()
+  const days = Math.max(1, Math.min(31, Number(c.req.query('days')) || 14))
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(fromRaw) ? fromRaw : new Date().toISOString().slice(0, 10)
+  const rows = (await q(`select co.id, co.title, co.pipeline_stage, co.channel, co.scheduled_for,
+      co.edited_asset_id,
+      ea.storage as edited_storage, ea.r2_key as edited_r2_key, ea.thumb_key as edited_thumb_key, ea.url as edited_url,
+      (select array_agg(cp.channel order by cp.channel) from content_posts cp
+         where cp.business_id=co.business_id and cp.content_id=co.id) as post_channels,
+      (select count(*)::int from content_posts cp where cp.business_id=co.business_id and cp.content_id=co.id and cp.status='posted') as posted_count
+    from content co
+    left join assets ea on ea.id=co.edited_asset_id and ea.business_id=co.business_id
+    where co.business_id=$1 and co.scheduled_for is not null
+      and co.scheduled_for >= $2::date and co.scheduled_for < ($2::date + $3::int)
+    order by co.scheduled_for asc, co.id asc`, [b, from, days])).rows
+  const haveR2 = !!r2Client()
+  // resolve a thumb per piece: edited cut's poster, else first source asset's thumb
+  const byDay = {}
+  for (const r of rows) {
+    let thumb_url = null
+    if (r.edited_asset_id) {
+      if (r.edited_storage === 'r2' && haveR2) thumb_url = r.edited_thumb_key ? await signGet(r.edited_thumb_key) : (r.edited_r2_key ? await signGet(r.edited_r2_key) : null)
+      else if (r.edited_storage && r.edited_storage !== 'r2') thumb_url = r.edited_url
+    }
+    if (!thumb_url) {
+      const srcs = await pieceAssets(b, r.id)
+      const firstThumb = srcs.find((s) => s.thumb_url)
+      if (firstThumb) thumb_url = firstThumb.thumb_url
+    }
+    const channels = Array.isArray(r.post_channels) && r.post_channels.length ? r.post_channels : (r.channel ? [r.channel] : [])
+    const key = new Date(r.scheduled_for).toISOString().slice(0, 10)
+    if (!byDay[key]) byDay[key] = []
+    byDay[key].push({
+      id: r.id, title: r.title, stage: r.pipeline_stage || 'scheduled',
+      channels, posted_count: r.posted_count || 0, thumb_url,
+      scheduled_for: r.scheduled_for,
+    })
+  }
+  const start = new Date(from + 'T00:00:00.000Z')
+  const grid = []
+  for (let i = 0; i < days; i++) {
+    const dd = new Date(start.getTime() + i * 86400000)
+    const key = dd.toISOString().slice(0, 10)
+    const pieces = byDay[key] || []
+    grid.push({ date: key, dow: dd.getUTCDay(), pieces, count: pieces.length })
+  }
+  const summary = { from, days, total: rows.length, open_days: grid.filter((g) => !g.count).length }
+  return c.json({ grid, summary })
+})
+
+// ---- THE CONTENT FUNNEL — Posts -> Reach -> Leads -> (Booked/Revenue), per channel + $/post ----
+// Honest where data is thin: zeros, not invented numbers. Lead count blends the legacy
+// content.leads_attributed (piece-level, pre-Phase-3) with the new per-channel content_posts.leads.
+// Booked/revenue ties leads to paid jobs sourced from content (jobs.source like 'website%'/'content%')
+// — attributable but coarse, flagged as such so he reads it honestly.
+app.get('/api/funnel', auth, async (c) => {
+  const b = biz(c)
+  // per-channel posting + reach + the new per-channel leads
+  const perChannel = (await q(`select channel,
+      count(*) filter (where status='posted')::int as posts,
+      count(*) filter (where status='planned')::int as planned,
+      coalesce(sum(reach),0)::int as reach,
+      coalesce(sum(leads),0)::int as post_leads
+    from content_posts where business_id=$1 group by channel`, [b])).rows
+  // legacy piece-level attribution (sum of content.leads_attributed) — kept honest as its own line
+  const legacy = (await q(`select coalesce(sum(leads_attributed),0)::int as n,
+      count(*) filter (where pipeline_stage='posted' or status='posted')::int as posted_pieces,
+      count(*)::int as pieces
+    from content where business_id=$1`, [b])).rows[0]
+  // revenue attributable to content: paid jobs whose source traces to the content funnel
+  const contentRev = (await q(`select count(*) filter (where status='paid')::int as paid_jobs,
+      coalesce(sum(charge) filter (where status='paid'),0)::float as revenue
+    from jobs where business_id=$1 and source ~* 'content|website:ai|website:triage|instagram|tiktok|youtube|social'`, [b])).rows[0]
+  const channels = perChannel.map((r) => ({
+    channel: r.channel,
+    posts: r.posts || 0,
+    planned: r.planned || 0,
+    reach: r.reach || 0,
+    leads: r.post_leads || 0,
+    cost_per_post: 0,                          // organic — $0; column exists so the UI can show $/post honestly
+  })).sort((a, z) => z.posts - a.posts || z.reach - a.reach)
+  const channelPostLeads = channels.reduce((s, r) => s + r.leads, 0)
+  // total content leads = the new per-channel leads + the legacy piece-level attribution
+  const totalLeads = channelPostLeads + (legacy.n || 0)
+  const totals = {
+    posts: channels.reduce((s, r) => s + r.posts, 0),
+    planned: channels.reduce((s, r) => s + r.planned, 0),
+    reach: channels.reduce((s, r) => s + r.reach, 0),
+    channel_leads: channelPostLeads,
+    legacy_leads: legacy.n || 0,
+    leads: totalLeads,
+    posted_pieces: legacy.posted_pieces || 0,
+    pieces: legacy.pieces || 0,
+    booked: contentRev.paid_jobs || 0,
+    revenue: contentRev.revenue || 0,
+    revenue_per_post: 0,
+  }
+  totals.revenue_per_post = totals.posts ? Math.round(totals.revenue / totals.posts) : 0
+  // honest read of whether the chain has real signal yet
+  const has_reach = totals.reach > 0
+  const has_revenue = totals.revenue > 0
+  return c.json({
+    funnel: [
+      { stage: 'Posts', value: totals.posts },
+      { stage: 'Reach', value: totals.reach },
+      { stage: 'Leads', value: totals.leads },
+      { stage: 'Booked', value: totals.booked },
+      { stage: 'Revenue', value: totals.revenue, money: true },
+    ],
+    channels, totals,
+    honest: { has_reach, has_revenue, note: has_reach ? null : 'Reach/leads are entered by hand on each post — add a couple and this chain fills in.' },
+  })
+})
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()

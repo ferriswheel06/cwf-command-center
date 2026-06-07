@@ -29,11 +29,11 @@ const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: '
 const NAV_GROUPS = [
   ['Acquire', [['pulse', 'Pulse', I.spark], ['triage', 'Triage', I.bolt]]],
   ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today], ['quotes', 'Quotes', I.money], ['customers', 'Customers', I.today], ['money', 'Money', I.money]]],
-  ['Grow', [['field', 'Field', I.pipeline], ['activation', 'Activation', I.bolt], ['proof', 'Proof', I.check], ['content', 'Content', I.spark]]],
-  ['Plan', [['handoffs', 'To Claude Code', I.spark], ['assets', 'Library', I.today], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
+  ['Grow', [['field', 'Field', I.pipeline], ['activation', 'Activation', I.bolt], ['proof', 'Proof', I.check], ['content', 'Studio', I.spark]]],
+  ['Plan', [['handoffs', 'To Claude Code', I.spark], ['vault', 'Vault', I.spark], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers', money: 'Money', field: 'Field', activation: 'Activation', proof: 'Proof', content: 'Content', handoffs: 'To Claude Code', assets: 'Asset library', templates: 'Templates', backburner: 'Back-burner' }
+const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers', money: 'Money', field: 'Field', activation: 'Activation', proof: 'Proof', content: 'Studio', handoffs: 'To Claude Code', vault: 'Vault', assets: 'Vault', templates: 'Templates', backburner: 'Back-burner' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -86,7 +86,8 @@ else if (tab === 'customers') await viewCustomers()
 else if (tab === 'templates') await viewTemplates()
 else if (tab === 'proof') await viewProof()
 else if (tab === 'content') await viewContent()
-else if (tab === 'assets') await viewAssets()
+else if (tab === 'vault') await viewVault()
+else if (tab === 'assets') await viewVault()
 else if (tab === 'calendar') await viewCalendar()
 else if (tab === 'field') await viewField()
 else if (tab === 'handoffs') await viewHandoffs()
@@ -1034,84 +1035,540 @@ function openProof() {
   }
 }
 
-/* ===================== CONTENT → LEADS ===================== */
+/* ===================== STUDIO · CONTENT PIPELINE (Phase 2) ===================== */
+/* The content factory. Raw footage in the Vault → a finished, captioned post.
+   Kanban over content.pipeline_stage; moving a card to "Editing" fires a
+   content_edit handoff carrying the source clips' R2 keys + the brief — that's
+   the Claude-Code editing bridge. Free AI drafts captions via the crm-api Worker.
+   The legacy lead-attribution lives on inside the card drawer (the stepper). */
 const CONTENT_STATUS = [['idea', 'Idea'], ['draft', 'Draft'], ['scheduled', 'Scheduled'], ['posted', 'Posted']]
 const CONTENT_PILL = { idea: 'lead', draft: 'lead', scheduled: 'quoted', posted: 'completed' }
+const STUDIO_COLS = [
+  ['idea', 'Idea', 'var(--fg4)'],
+  ['raw', 'Raw', 'var(--ai)'],
+  ['editing', 'Editing', 'var(--ai)'],
+  ['ready', 'Ready', 'var(--green)'],
+  ['scheduled', 'Scheduled', 'var(--navy)'],
+  ['posted', 'Posted', 'var(--accent)'],
+]
+const STAGE_LABEL = { idea: 'Idea', raw: 'Raw', editing: 'Editing', ready: 'Ready', scheduled: 'Scheduled', posted: 'Posted' }
+const STAGE_PILL = { idea: 'lead', raw: 'lead', editing: 'in_progress', ready: 'completed', scheduled: 'scheduled', posted: 'completed' }
+// the channel a card is tagged with → a short chip color cue (purely cosmetic)
+const CHANNELS = [['instagram', 'Instagram'], ['tiktok', 'TikTok'], ['youtube', 'YouTube'], ['gbp', 'Google'], ['reel', 'Reel'], ['facebook', 'Facebook']]
+let _pipelineData = null   // cached so card clicks reopen the drawer without a refetch
+
 async function viewContent() {
-  const d = await api('/api/content'); const items = d.content || []; const s = d.summary || {}; const winners = d.winners || []
-  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn primary" id="ct-add">${I.plus} Log a piece</button>`; $('#ct-add').onclick = () => openContent() }
-  const top = winners.filter((w) => (w.leads_attributed || 0) > 0)
+  const d = await api('/api/pipeline')
+  _pipelineData = d
+  const stages = d.stages || {}, counts = d.counts || {}, order = (d.order && d.order.length) ? d.order : STUDIO_COLS.map((c) => c[0])
+  const all = Object.values(stages).flat()
+  const inEditing = (stages.editing || []).length
+  const live = all.filter((p) => p.pipeline_stage === 'posted').length
+  const totalLeads = all.reduce((s, p) => s + (Number(p.leads_attributed) || 0), 0)
+  const tr = $('.topbar .right')
+  if (tr) { tr.innerHTML = `<button class="btn ghost sm" id="st-claude">${I.spark} Editing queue</button><button class="btn primary" id="st-add">${I.plus} New piece</button>`
+    $('#st-add').onclick = () => openContentComposer()
+    $('#st-claude').onclick = () => renderApp('handoffs') }
   setView(`
-    <div class="brief"><span class="tag">${I.bolt} What actually pulls leads in</span>
-      <p>Not likes — leads. Log every post and tick a lead when something lands in your DMs because of it. The pieces that produce real jobs rise to the top — pour your energy there, drop the rest.</p></div>
+    <div class="brief"><span class="tag">${I.spark} Footage in, finished posts out</span>
+      <p>Turn the raw clips you dumped in the Vault into posts — Claude Code does the cut. Move a card to <b>Editing</b> and it ships the source clips + the brief straight to the editing bench; it comes back a captioned, sized post in <b>Ready</b>, one tap from going live.</p></div>
     <div class="kpis">
-      <div class="kpi"><div class="lab">Pieces</div><div class="val">${s.pieces || 0}</div><div class="meta">logged</div></div>
-      <div class="kpi"><div class="lab">Posted</div><div class="val">${s.posted || 0}</div><div class="meta">live</div></div>
-      <div class="kpi primary"><div class="lab">Leads from content</div><div class="val">${s.total_leads || 0}</div><div class="meta">DMs it pulled</div></div>
-      <div class="kpi"><div class="lab">Top piece</div><div class="val">${top.length ? (top[0].leads_attributed || 0) : 0}</div><div class="meta">${top.length ? esc((top[0].title || '').slice(0, 18)) : 'none yet'}</div></div>
+      <div class="kpi"><div class="lab">In the pipeline</div><div class="val">${all.length}</div><div class="meta">pieces</div></div>
+      <div class="kpi ${inEditing ? 'warn' : ''}"><div class="lab">Editing now</div><div class="val">${inEditing}</div><div class="meta">Claude's on it</div></div>
+      <div class="kpi"><div class="lab">Posted</div><div class="val">${live}</div><div class="meta">live</div></div>
+      <div class="kpi primary"><div class="lab">Leads from content</div><div class="val">${totalLeads}</div><div class="meta">DMs it pulled</div></div>
     </div>
-    ${top.length ? `<div class="sec-h"><span class="label">Winners — pour energy here</span><span class="ct">${top.length}</span></div>
-      <div class="list">${top.slice(0, 5).map(contentRow).join('')}</div>` : ''}
-    <div class="sec-h"><span class="label">All content</span><span class="ct">${items.length}</span></div>
-    ${items.length ? `<div class="list">${items.map(contentRow).join('')}</div>`
-      : emptyState('Nothing logged yet', 'Log your first post — the "shop said $X, I did $Y" reel, the brake job clip. Then mark a lead every time one shows up because of it, and let the winners surface.')}
+    ${all.length ? '' : emptyState('Pipeline is empty', 'Hit "New piece", give it a title, and pick the source clips from your Vault. Move it to Editing and Claude Code cuts it into a captioned post — that\'s the whole loop.')}
+    <div class="board studio-board">${order.map((k) => {
+      const col = STUDIO_COLS.find((c) => c[0] === k) || [k, STAGE_LABEL[k] || k, 'var(--fg4)']
+      const items = stages[k] || []
+      return `<div class="col"><div class="col__h"><span class="dot" style="background:${col[2]}"></span>
+        <span class="ttl">${esc(col[1])}</span><span class="ct">${counts[k] != null ? counts[k] : items.length}</span></div>
+        <div class="col__b">${items.map(studioCard).join('') || '<div class="col__empty">—</div>'}</div></div>`
+    }).join('')}</div>
   `)
-  bindContent()
+  bindStudio()
 }
-function contentRow(c) {
-  const st = c.status || 'posted'
-  const leads = c.leads_attributed || 0
-  return `<div class="lrow ct-row">
-    <div class="grow">
-      <div class="nm">${c.url ? `<a class="ct-link" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title || 'Untitled')}</a>` : esc(c.title || 'Untitled')}</div>
-      <div class="qmeta">
-        <span class="pill ${CONTENT_PILL[st] || 'lead'}"><span class="dot"></span>${esc((CONTENT_STATUS.find((x) => x[0] === st) || [, st])[1])}</span>
-        ${c.channel ? `<span class="age-tag">${esc(c.channel)}</span>` : ''}
-        <span class="lead-tag ${leads ? 'on' : ''}">${leads} lead${leads === 1 ? '' : 's'}</span>
-        ${c.posted_at || c.created_at ? `<span class="ct-when">${ago(c.posted_at || c.created_at)} ago</span>` : ''}
-      </div>
-    </div>
-    <div class="qright">
-      <div class="lead-stepper">
-        <button class="step-btn" data-ct-dec="${c.id}" title="Remove a lead">−</button>
-        <b class="num">${leads}</b>
-        <button class="step-btn primary" data-ct-inc="${c.id}" title="A lead came from this">+</button>
-      </div>
-      <div class="qacts"><button class="btn ghost sm" data-ct-del="${c.id}">${I.x}</button></div>
+
+function thumbStrip(assets) {
+  const list = (assets || []).slice(0, 4)
+  if (!list.length) return ''
+  const more = (assets || []).length - list.length
+  return `<div class="st-strip">${list.map((a) => {
+    const isClip = a.kind === 'clip'
+    return `<span class="st-thumb ${isClip ? 'clip' : ''}">${a.thumb_url
+      ? `<img src="${esc(a.thumb_url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">`
+      : `<span class="st-kind">${esc((a.kind || 'doc').slice(0, 3).toUpperCase())}</span>`}${isClip ? `<span class="st-play">${I.spark}</span>` : ''}</span>`
+  }).join('')}${more > 0 ? `<span class="st-thumb more">+${more}</span>` : ''}</div>`
+}
+
+function studioCard(p) {
+  const stage = p.pipeline_stage || 'idea'
+  const sc = (p.source_count != null ? p.source_count : (p.assets || []).length)
+  const clips = (p.assets || []).filter((a) => a.kind === 'clip').length
+  const photos = (p.assets || []).filter((a) => a.kind === 'photo').length
+  const srcLabel = sc ? [clips ? `${clips} clip${clips === 1 ? '' : 's'}` : '', photos ? `${photos} photo${photos === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ') || `${sc} source${sc === 1 ? '' : 's'}` : 'no sources yet'
+  const editing = stage === 'editing'
+  const claudeLive = editing && p.handoff_id && p.handoff_status && p.handoff_status !== 'done'
+  return `<div class="jc st-card ${editing ? 'editing' : ''}" data-piece="${p.id}">
+    <div class="jc__top"><div style="min-width:0"><div class="nm">${esc(p.title || 'Untitled')}</div>
+      ${p.channel ? `<div class="veh">${esc(channelLabel(p.channel))}</div>` : ''}</div>
+      ${(Number(p.leads_attributed) || 0) > 0 ? `<span class="ai-score">${I.spark}${p.leads_attributed} lead${p.leads_attributed === 1 ? '' : 's'}</span>` : ''}</div>
+    ${thumbStrip(p.assets)}
+    ${claudeLive ? `<div class="st-claude-live">${I.spark}<span>Claude Code is on it</span></div>`
+      : (stage === 'ready' && p.edited_url) ? `<div class="st-ready-mark">${I.check}<span>Cut ready — preview &amp; post</span></div>` : ''}
+    <div class="jc__foot">
+      <span class="st-src">${esc(srcLabel)}</span>
+      ${p.pipeline_stage !== 'posted' ? `<button class="btn ghost sm st-fwd" data-piece-fwd="${p.id}" data-stage="${stage}" title="Move forward">${I.arrow}</button>` : ''}
     </div>
   </div>`
 }
-function bindContent() {
-  app.querySelectorAll('[data-ct-inc]').forEach((b) => (b.onclick = async () => { await api(`/api/content/${b.dataset.ctInc}/attribute`, { method: 'POST', body: JSON.stringify({ delta: 1 }) }); renderApp('content') }))
-  app.querySelectorAll('[data-ct-dec]').forEach((b) => (b.onclick = async () => { await api(`/api/content/${b.dataset.ctDec}/attribute`, { method: 'POST', body: JSON.stringify({ delta: -1 }) }); renderApp('content') }))
-  app.querySelectorAll('[data-ct-del]').forEach((b) => (b.onclick = async () => {
-    if (!confirm('Delete this piece?')) return
-    await api(`/api/content/${b.dataset.ctDel}/delete`, { method: 'POST' }); renderApp('content')
+function channelLabel(ch) { const m = CHANNELS.find((c) => c[0] === String(ch).toLowerCase()); return m ? m[1] : ch }
+function nextStage(stage) { const i = STUDIO_COLS.findIndex((c) => c[0] === stage); return (i >= 0 && i < STUDIO_COLS.length - 1) ? STUDIO_COLS[i + 1][0] : null }
+
+function bindStudio() {
+  app.querySelectorAll('[data-piece]').forEach((el) => (el.onclick = (e) => { if (e.target.closest('[data-piece-fwd]')) return; openPieceDrawer(el.dataset.piece) }))
+  app.querySelectorAll('[data-piece-fwd]').forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation()
+    const nx = nextStage(b.dataset.stage); if (!nx) return
+    await moveStage(b.dataset.pieceFwd, nx)
   }))
 }
-function openContent() {
+
+// Move a piece to a stage; surface the Claude-Code confirmation when it fires the bridge.
+async function moveStage(id, stage) {
+  const res = await api(`/api/content/${id}/stage`, { method: 'POST', body: JSON.stringify({ stage }) })
+  if (stage === 'editing' && res && res.handoff) studioSentToast()
+  else if (stage === 'editing' && res && !res.handoff) toast('Add source clips first — then Editing sends them to Claude Code.', 'warn')
+  await renderApp('content')
+  return res
+}
+
+// the magic moment: a violet confirmation that the clips went to the editing bench
+function studioSentToast() {
+  const t = document.createElement('div')
+  t.className = 'st-toast'
+  t.innerHTML = `<span class="st-toast__ic">${I.spark}</span>
+    <div class="st-toast__body"><b>Sent to Claude Code to edit ✦</b>
+      <span>The source clips + the brief are on the editing bench. The finished cut lands in <b>Ready</b>.</span></div>
+    <button class="st-toast__go">Editing queue ${I.arrow}</button>`
+  document.body.appendChild(t)
+  requestAnimationFrame(() => t.classList.add('in'))
+  const kill = () => { t.classList.remove('in'); setTimeout(() => t.remove(), 260) }
+  t.querySelector('.st-toast__go').onclick = () => { kill(); renderApp('handoffs') }
+  setTimeout(kill, 5200)
+}
+function toast(msg, kind) {
+  const t = document.createElement('div')
+  t.className = 'st-toast mini' + (kind ? ' ' + kind : '')
+  t.innerHTML = `<span class="st-toast__ic">${kind === 'warn' ? I.bolt : I.check}</span><div class="st-toast__body"><span>${esc(msg)}</span></div>`
+  document.body.appendChild(t)
+  requestAnimationFrame(() => t.classList.add('in'))
+  setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 260) }, 3200)
+}
+
+/* ---- NEW PIECE composer: title, channel, source clips from the Vault, optional brief ---- */
+async function openContentComposer() {
+  let vault = []
+  try { vault = (await api('/api/vault')).assets || [] } catch (e) { vault = [] }
+  // photos + clips are the shootable sources; docs/quotes/invoices aren't content material
+  const pickable = vault.filter((a) => a.kind === 'clip' || a.kind === 'photo')
+  const picked = new Set()
   const wrap = document.createElement('div')
-  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
-    <div class="modal__h"><div class="t-h2">Log a piece</div><button class="drawer__close mclose">${I.x}</button></div>
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal st-composer">
+    <div class="modal__h"><div class="t-h2">New piece</div><button class="drawer__close mclose">${I.x}</button></div>
     <div class="modal__b">
-      <div class="field"><label>Title</label><input class="input" id="ct-title" placeholder='e.g. "Shop quoted $2,400 — I did it for less" reel'></div>
-      <div class="field"><label>Channel</label><input class="input" id="ct-channel" placeholder="Instagram, TikTok, Google post…"></div>
-      <div class="field"><label>Status</label>
-        <select class="input" id="ct-status">${CONTENT_STATUS.map(([v, l]) => `<option value="${v}" ${v === 'posted' ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
-      <div class="field"><label>Link (optional)</label><input class="input" id="ct-url" placeholder="https://…"></div>
-      <div class="field"><label>Note (optional)</label><input class="input" id="ct-notes" placeholder="The angle / what worked"></div>
+      <div class="field"><label>Title / the angle</label><input class="input" id="st-title" placeholder='e.g. "Shop quoted $2,400 — I did it at his door" reel'></div>
+      <div class="st-row2">
+        <div class="field"><label>Channel</label>
+          <select class="input" id="st-channel"><option value="">— pick one —</option>${CHANNELS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+        <div class="field"><label>Start in</label>
+          <select class="input" id="st-stage">${STUDIO_COLS.slice(0, 2).map(([v, l]) => `<option value="${v}" ${v === 'raw' ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      </div>
+      <div class="field"><label>Source clips from the Vault</label>
+        ${pickable.length
+          ? `<div class="st-pick" id="st-pick">${pickable.map(composerTile).join('')}</div>
+             <div class="st-pick-note"><span id="st-picksum">0 selected</span> — these are the clips Claude Code will cut from.</div>`
+          : `<div class="st-pick-empty">No photos or clips in the Vault yet. Dump some in the Vault first, then pick them here.</div>`}
+      </div>
+      <div class="field"><label>Brief for the edit (optional)</label>
+        <textarea class="input ta" id="st-brief" rows="3" placeholder="The hook, the cut you want, the on-screen text — anything Claude needs to make the post. Leave blank and it'll draft from the title in Fares' voice."></textarea></div>
     </div>
-    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="ct-save">Log it</button></div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="st-save">${I.plus} Create piece</button></div>
   </div>`
   document.body.appendChild(wrap)
   const close = () => wrap.remove()
   $('.scrim', wrap).onclick = close
   wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
-  $('#ct-save', wrap).onclick = async () => {
-    const title = $('#ct-title', wrap).value.trim(); if (!title) return
-    const body = { title, channel: $('#ct-channel', wrap).value.trim() || undefined, status: $('#ct-status', wrap).value, url: $('#ct-url', wrap).value.trim() || undefined, notes: $('#ct-notes', wrap).value.trim() || undefined }
+  const sum = $('#st-picksum', wrap)
+  wrap.querySelectorAll('[data-pick]').forEach((el) => (el.onclick = () => {
+    const id = el.dataset.pick
+    if (picked.has(id)) { picked.delete(id); el.classList.remove('on') } else { picked.add(id); el.classList.add('on') }
+    if (sum) sum.textContent = `${picked.size} selected`
+  }))
+  $('#st-save', wrap).onclick = async () => {
+    const title = $('#st-title', wrap).value.trim(); if (!title) { $('#st-title', wrap).focus(); return }
+    const body = {
+      title,
+      channel: $('#st-channel', wrap).value || undefined,
+      pipeline_stage: $('#st-stage', wrap).value || 'raw',
+      brief: $('#st-brief', wrap).value.trim() || undefined,
+      asset_ids: [...picked].map(Number),
+    }
+    const btn = $('#st-save', wrap); btn.disabled = true
     await api('/api/content', { method: 'POST', body: JSON.stringify(body) })
     close(); renderApp('content')
+  }
+}
+function composerTile(a) {
+  const isClip = a.kind === 'clip'
+  return `<button class="st-ptile" data-pick="${a.id}" title="${esc(a.label || a.kind || '')}">
+    ${a.thumb_url ? `<img src="${esc(a.thumb_url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">` : `<span class="st-kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}
+    ${isClip ? `<span class="st-play">${I.spark}</span>${a.duration_s ? `<span class="st-dur">${fmtDur(a.duration_s)}</span>` : ''}` : ''}
+    <span class="st-ptile__check">${I.check}</span>
+  </button>`
+}
+
+/* ---- PIECE detail drawer: sources, caption (AI draft + copy), edited preview, stage move + post + leads ---- */
+async function openPieceDrawer(id) {
+  // pull the freshest copy from the cached pipeline payload, fall back to a tiny refetch
+  let p = null
+  if (_pipelineData) p = Object.values(_pipelineData.stages || {}).flat().find((x) => String(x.id) === String(id))
+  if (!p) { try { const d = await api('/api/pipeline'); _pipelineData = d; p = Object.values(d.stages || {}).flat().find((x) => String(x.id) === String(id)) } catch (e) {} }
+  if (!p) return
+  const stage = p.pipeline_stage || 'idea'
+  const hashtags = Array.isArray(p.hashtags) ? p.hashtags : []
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><aside class="drawer st-drawer">
+    <div class="drawer__h"><span class="pill ${STAGE_PILL[stage] || 'lead'}"><span class="dot"></span>${esc(STAGE_LABEL[stage] || stage)}</span>
+      ${p.channel ? `<span class="age-tag">${esc(channelLabel(p.channel))}</span>` : ''}
+      <button class="drawer__close">${I.x}</button></div>
+    <div class="drawer__b">
+      <div class="t-h2">${esc(p.title || 'Untitled')}</div>
+      ${p.source_note ? `<div class="st-brief-read">${esc(p.source_note)}</div>` : ''}
+
+      ${stage === 'editing' && p.handoff_id && p.handoff_status !== 'done'
+        ? `<div class="st-claude-banner">${I.spark}<div><b>Claude Code is editing this now</b><span>Source clips + the brief are on the editing bench. The finished cut drops into Ready.</span></div></div>`
+        : ''}
+
+      ${p.edited_asset_id ? `<div><div class="label" style="margin-bottom:var(--s2)">The finished cut</div>
+        <div class="st-edited" id="st-edited"><div class="loading">Loading the cut…</div></div></div>` : ''}
+
+      <div><div class="label" style="margin-bottom:var(--s2)">Source clips <span class="st-srcct">${(p.assets || []).length}</span></div>
+        <div class="st-sources" id="st-sources">${(p.assets || []).length ? (p.assets || []).map(sourceTile).join('') : '<div class="st-pick-empty">No sources attached. Add clips from the Vault below.</div>'}</div>
+        <button class="btn ghost sm" id="st-addsrc" style="margin-top:var(--s2)">${I.plus} Add source clips</button></div>
+
+      <div><div class="label" style="margin-bottom:var(--s2)">Caption</div>
+        <div class="st-caption-wrap">
+          <div class="field"><input class="input" id="st-hook" placeholder="Hook (scroll-stopping first line)" value="${esc(p.hook || '')}"></div>
+          <textarea class="input ta" id="st-cap" rows="4" placeholder="The caption — Fares' voice, ends on a soft come-to-you CTA. Tap AI draft to fill it.">${esc(p.caption || '')}</textarea>
+          <input class="input" id="st-tags" placeholder="#hashtags" value="${esc(hashtags.join(' '))}">
+          <div class="st-cap-acts">
+            <button class="btn ai sm" id="st-ai">${I.spark} AI draft</button>
+            <button class="btn ghost sm" id="st-copy">${I.check} Copy caption</button>
+          </div>
+        </div></div>
+
+      <div><div class="label" style="margin-bottom:var(--s2)">Move it along</div>
+        <div class="st-stage-row">${STUDIO_COLS.map(([k, l]) => `<button class="st-stage-chip ${k === stage ? 'on' : ''}" data-mv="${k}">${esc(l)}</button>`).join('')}</div>
+        ${stage !== 'editing' && stage !== 'posted' ? `<button class="btn ai sm st-send" id="st-send">${I.spark} Send to Claude Code to edit</button>` : ''}
+      </div>
+
+      <div class="st-post" id="st-post"><div class="loading">Loading posting…</div></div>
+
+      <div class="st-leads">
+        <div><div class="label">Leads it pulled</div><div class="st-leads-sub">Tick one every time a DM lands because of this piece.</div></div>
+        <div class="lead-stepper">
+          <button class="step-btn" id="st-lead-dec" title="Remove a lead">−</button>
+          <b class="num" id="st-lead-n">${Number(p.leads_attributed) || 0}</b>
+          <button class="step-btn primary" id="st-lead-inc" title="A lead came from this">+</button>
+        </div>
+      </div>
+
+      <div class="st-drawer-foot">
+        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">${I.arrow} View post</a>` : ''}
+        <button class="btn ghost sm st-del" id="st-del">${I.x} Delete piece</button>
+      </div>
+    </div></aside>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close; $('.drawer__close', wrap).onclick = close
+
+  // resolve a fresh, playable URL for the finished cut (signed GET) and render the player
+  const ed = $('#st-edited', wrap)
+  if (ed && p.edited_asset_id) {
+    let full = p.edited_url, mime = ''
+    try { const u = await api(`/api/assets/${p.edited_asset_id}/url`); if (u && u.url) { full = u.url; mime = u.mime || '' } } catch (e) { /* fall back to the thumb */ }
+    const isImg = /^image\//.test(mime) || (!mime && /\.(jpe?g|png|webp|gif)(\?|$)/i.test(full || ''))
+    ed.innerHTML = isImg
+      ? `<img src="${esc(full || '')}" alt="">`
+      : `<video src="${esc(full || '')}" controls playsinline preload="metadata" poster="${esc(p.edited_url || '')}"></video>`
+  }
+
+  // stage chips + the explicit send-to-editing CTA
+  wrap.querySelectorAll('[data-mv]').forEach((b) => (b.onclick = async () => {
+    if (b.dataset.mv === stage) return
+    close(); await moveStage(id, b.dataset.mv)
+  }))
+  const send = $('#st-send', wrap); if (send) send.onclick = async () => { close(); await moveStage(id, 'editing') }
+
+  // AI draft (violet) — fills hook/caption/hashtags, editable
+  const ai = $('#st-ai', wrap); if (ai) ai.onclick = async () => {
+    const old = ai.innerHTML; ai.disabled = true; ai.innerHTML = `${I.spark} Drafting…`
+    try {
+      const r = await api(`/api/content/${id}/caption`, { method: 'POST', body: JSON.stringify({ channel: p.channel || undefined }) })
+      if (r && r.drafted) {
+        if (r.hook != null) $('#st-hook', wrap).value = r.hook || ''
+        if (r.caption != null) $('#st-cap', wrap).value = r.caption || ''
+        if (Array.isArray(r.hashtags)) $('#st-tags', wrap).value = r.hashtags.join(' ')
+        toast('AI drafted the caption — tweak it and copy.')
+      } else toast((r && r.note) || 'AI is busy — type it yourself or try again.', 'warn')
+    } catch (e) { toast('AI is busy — try again in a sec.', 'warn') }
+    ai.disabled = false; ai.innerHTML = old
+  }
+  const copy = $('#st-copy', wrap); if (copy) copy.onclick = () => {
+    const txt = [$('#st-hook', wrap).value.trim(), $('#st-cap', wrap).value.trim(), $('#st-tags', wrap).value.trim()].filter(Boolean).join('\n\n')
+    copyText(txt, copy)
+  }
+
+  // add more sources from the Vault
+  const addSrc = $('#st-addsrc', wrap); if (addSrc) addSrc.onclick = () => openSourcePicker(id, async () => { close(); openPieceDrawer(id) })
+  // detach a source
+  wrap.querySelectorAll('[data-src-del]').forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation()
+    await api(`/api/content/${id}/assets/${b.dataset.srcDel}`, { method: 'DELETE' })
+    // refresh the drawer with the new source set
+    try { const d = await api('/api/pipeline'); _pipelineData = d } catch (_) {}
+    close(); openPieceDrawer(id)
+  }))
+
+  // posting panel (schedule + assisted post + per-channel metrics) — rebuilds in place
+  renderPostPanel(wrap, p)
+
+  // leads stepper (legacy attribution preserved)
+  const ln = $('#st-lead-n', wrap)
+  const bump = async (delta) => { const r = await api(`/api/content/${id}/attribute`, { method: 'POST', body: JSON.stringify({ delta }) }); if (ln && r) ln.textContent = r.leads_attributed }
+  const li = $('#st-lead-inc', wrap); if (li) li.onclick = () => bump(1)
+  const ld = $('#st-lead-dec', wrap); if (ld) ld.onclick = () => bump(-1)
+
+  const del = $('#st-del', wrap); if (del) del.onclick = async () => {
+    if (!confirm('Delete this piece? Its source clips stay in the Vault.')) return
+    await api(`/api/content/${id}/delete`, { method: 'POST' }); close(); renderApp('content')
+  }
+}
+function sourceTile(a) {
+  const isClip = a.kind === 'clip'
+  return `<div class="st-srctile ${isClip ? 'clip' : ''}">
+    ${a.thumb_url ? `<img src="${esc(a.thumb_url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">` : `<span class="st-kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}
+    ${isClip ? `<span class="st-play">${I.spark}</span>${a.duration_s ? `<span class="st-dur">${fmtDur(a.duration_s)}</span>` : ''}` : ''}
+    <button class="st-srctile__x" data-src-del="${a.id}" title="Remove">${I.x}</button>
+  </div>`
+}
+/* ---- POSTING (Phase 3): schedule + assisted "post now" + per-channel reach/leads ----
+   Honest by design: no full IG/TikTok auto-post. "Post now" copies the caption, opens
+   the channel, and you mark it posted + paste the URL. Per-channel reach/leads feed the
+   funnel. content_posts is the spine; the 'social' activation gate wires real auto-post. */
+const POST_CHANNELS_UI = [['gbp', 'Google Business'], ['youtube', 'YouTube'], ['instagram', 'Instagram'], ['tiktok', 'TikTok'], ['facebook', 'Facebook'], ['reel', 'Reel']]
+// where "post now" opens — the create/upload surface per channel
+const CHANNEL_OPEN = {
+  gbp: 'https://business.google.com/posts',
+  youtube: 'https://www.youtube.com/upload',
+  instagram: 'https://www.instagram.com/',
+  tiktok: 'https://www.tiktok.com/upload',
+  facebook: 'https://www.facebook.com/',
+  reel: 'https://www.instagram.com/',
+}
+// friction note per channel (sets honest expectations inline)
+const CHANNEL_NOTE = {
+  gbp: 'Easiest — paste & post', youtube: 'Easiest real auto-upload (later)',
+  instagram: 'Auto-post needs 2-4wk app review', tiktok: 'Public needs a TikTok audit',
+  facebook: 'Auto-post via Meta app review', reel: 'IG Reel — paste & post',
+}
+
+function captionFor(wrap, p) {
+  const hook = wrap ? ($('#st-hook', wrap)?.value || '').trim() : ''
+  const cap = wrap ? ($('#st-cap', wrap)?.value || '').trim() : ''
+  const tags = wrap ? ($('#st-tags', wrap)?.value || '').trim() : ''
+  return [hook || p.hook, cap || p.caption, tags || (Array.isArray(p.hashtags) ? p.hashtags.join(' ') : '')].filter(Boolean).join('\n\n')
+}
+
+function renderPostPanel(wrap, p) {
+  const host = $('#st-post', wrap); if (!host) return
+  const stage = p.pipeline_stage || 'idea'
+  const posts = p.posts || []   // content_posts rows ride along on the pipeline payload (added below)
+  const scheduled = !!p.scheduled_for
+  // only meaningful once a cut exists / piece is past editing — but allow scheduling from Ready onward
+  const canPost = stage === 'ready' || stage === 'scheduled' || stage === 'posted'
+  if (!canPost) {
+    host.innerHTML = `<div class="label" style="margin-bottom:var(--s2)">Posting</div>
+      <div class="st-post-locked">${I.spark}<span>Get it to <b>Ready</b> (Claude Code cuts it), then schedule + post it here — one tap copies the caption and opens the channel.</span></div>`
+    return
+  }
+  const whenTxt = scheduled ? new Date(p.scheduled_for).toLocaleString('en-CA', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null
+  host.innerHTML = `
+    <div class="label" style="margin-bottom:var(--s2)">Posting</div>
+    <div class="st-sched-bar">
+      <div class="st-sched-when">${scheduled ? `${I.today} <b>${esc(whenTxt)}</b>` : `<span class="st-sched-no">Not scheduled yet</span>`}</div>
+      <button class="btn ghost sm" id="st-sched">${I.today} ${scheduled ? 'Reschedule' : 'Schedule'}</button>
+    </div>
+    ${posts.length ? `<div class="st-channels">${posts.map((c) => postChannelRow(c)).join('')}</div>`
+      : `<div class="st-post-note">${I.bolt}<span>Schedule it to one or more channels — each becomes a one-tap post here.</span></div>`}
+    <div class="st-post-hint">Honest mode: "Post now" copies the caption + opens the channel. Paste, post, then mark it + drop the link. Auto-post is the <b>social</b> activation gate.</div>
+  `
+  // schedule
+  const sb = $('#st-sched', host); if (sb) sb.onclick = () => openScheduleContent(p, () => refreshPiece(wrap, p.id))
+  // per-channel actions
+  host.querySelectorAll('[data-post-now]').forEach((b) => (b.onclick = async () => {
+    const ch = b.dataset.postNow
+    await copyText(captionFor(wrap, p), b)
+    window.open(CHANNEL_OPEN[ch] || '#', '_blank', 'noopener')
+    toast('Caption copied — paste it in ' + channelLabel(ch) + ', then mark it posted.')
+  }))
+  host.querySelectorAll('[data-post-mark]').forEach((b) => (b.onclick = () => openMarkPosted(p, b.dataset.postMark, () => refreshPiece(wrap, p.id))))
+  host.querySelectorAll('[data-post-metrics]').forEach((b) => (b.onclick = () => openPostMetrics(p, b.dataset.postMetrics, () => refreshPiece(wrap, p.id))))
+}
+function postChannelRow(c) {
+  const posted = c.status === 'posted'
+  return `<div class="st-chrow ${posted ? 'posted' : ''}">
+    <span class="st-chrow__ch"><span class="cc-ch ${esc(c.channel)}">${esc(channelShort(c.channel))}</span>${esc(channelLabel(c.channel))}</span>
+    <span class="st-chrow__stat">${posted ? `${I.check} posted` : 'planned'}${(c.reach || c.leads) ? ` · ${(c.reach || 0).toLocaleString()} reach${c.leads ? ` · ${c.leads} lead${c.leads === 1 ? '' : 's'}` : ''}` : ''}</span>
+    <div class="st-chrow__acts">
+      ${posted
+        ? `${c.external_url ? `<a class="btn ghost sm" href="${esc(c.external_url)}" target="_blank" rel="noopener">${I.arrow}</a>` : ''}<button class="btn ghost sm" data-post-metrics="${esc(c.channel)}">${I.spark} Stats</button>`
+        : `<button class="btn primary sm" data-post-now="${esc(c.channel)}">${I.arrow} Post now</button><button class="btn ghost sm" data-post-mark="${esc(c.channel)}" title="Mark posted">${I.check}</button>`}
+    </div>
+  </div>`
+}
+// re-pull the pipeline payload and re-open the drawer so post rows refresh in place
+async function refreshPiece(wrap, id) {
+  try { const d = await api('/api/pipeline'); _pipelineData = d } catch (_) {}
+  if (wrap) wrap.remove()
+  openPieceDrawer(id)
+}
+
+/* schedule-to-channels modal */
+function openScheduleContent(p, onDone) {
+  const cur = p.scheduled_for ? new Date(p.scheduled_for) : new Date(Date.now() + 86400000)
+  const curDate = cur.toISOString().slice(0, 10)
+  const curTime = String(cur.getHours()).padStart(2, '0') + ':' + String(cur.getMinutes()).padStart(2, '0')
+  const already = new Set((p.posts || []).map((x) => x.channel))
+  if (p.channel) already.add(p.channel)
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Schedule · ${esc(p.title || '')}</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="st-row2">
+        <div class="field"><label>Day</label><input class="input" id="sc-date" type="date" value="${curDate}"></div>
+        <div class="field"><label>Time</label><input class="input" id="sc-time" type="time" value="${curTime}"></div>
+      </div>
+      <div class="field"><label>Channels</label>
+        <div class="st-chpick" id="sc-channels">${POST_CHANNELS_UI.map(([v, l]) => `<button class="st-chpick__b ${already.has(v) ? 'on' : ''}" data-chpick="${v}"><span class="cc-ch ${v}">${channelShort(v)}</span>${esc(l)}<i class="st-chpick__note">${esc(CHANNEL_NOTE[v] || '')}</i></button>`).join('')}</div>
+        <div class="st-pick-note">Each picked channel becomes a one-tap post. YouTube + Google are the low-friction ones — IG/TikTok auto-post is the gated future.</div>
+      </div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="sc-save">${I.check} Schedule it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  const picked = new Set(already)
+  wrap.querySelectorAll('[data-chpick]').forEach((b) => (b.onclick = () => {
+    const v = b.dataset.chpick
+    if (picked.has(v)) { picked.delete(v); b.classList.remove('on') } else { picked.add(v); b.classList.add('on') }
+  }))
+  $('#sc-save', wrap).onclick = async () => {
+    const date = $('#sc-date', wrap).value, time = $('#sc-time', wrap).value || '09:00'
+    if (!date) { $('#sc-date', wrap).focus(); return }
+    const when = new Date(date + 'T' + time).toISOString()
+    const btn = $('#sc-save', wrap); btn.disabled = true
+    await api(`/api/content/${p.id}/schedule`, { method: 'POST', body: JSON.stringify({ scheduled_for: when, channels: [...picked] }) })
+    close(); onDone && onDone()
+  }
+}
+
+/* mark a channel posted (optionally paste the live URL) */
+function openMarkPosted(p, channel, onDone) {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Mark posted · ${esc(channelLabel(channel))}</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Link to the post (optional)</label><input class="input" id="mp-url" placeholder="https://… the live post"></div>
+      <div class="vault-note">Pasting the URL lets you jump back to it and helps tie leads to this exact post in the funnel.</div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="mp-save">${I.check} It's live</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#mp-save', wrap).onclick = async () => {
+    const btn = $('#mp-save', wrap); btn.disabled = true
+    const r = await api(`/api/content/${p.id}/post`, { method: 'POST', body: JSON.stringify({ channel, external_url: $('#mp-url', wrap).value.trim() || undefined }) })
+    close()
+    if (r && r.all_posted) toast('All channels posted — piece is live ✦')
+    onDone && onDone()
+  }
+}
+
+/* per-channel reach + leads entry (feeds the funnel) */
+function openPostMetrics(p, channel, onDone) {
+  const cur = (p.posts || []).find((x) => x.channel === channel) || {}
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Stats · ${esc(channelLabel(channel))}</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="st-row2">
+        <div class="field"><label>Reach / views</label><input class="input" id="pm-reach" inputmode="numeric" placeholder="0" value="${cur.reach || ''}"></div>
+        <div class="field"><label>Leads it pulled</label><input class="input" id="pm-leads" inputmode="numeric" placeholder="0" value="${cur.leads || ''}"></div>
+      </div>
+      <div class="vault-note">Enter these by hand off the app's insights. The Field funnel reads them to show which channel actually turns reach into booked jobs.</div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="pm-save">${I.check} Save stats</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#pm-save', wrap).onclick = async () => {
+    const reach = $('#pm-reach', wrap).value.trim(), leads = $('#pm-leads', wrap).value.trim()
+    const btn = $('#pm-save', wrap); btn.disabled = true
+    await api(`/api/content/${p.id}/metrics`, { method: 'POST', body: JSON.stringify({ channel, reach: reach === '' ? undefined : Number(reach), leads: leads === '' ? undefined : Number(leads) }) })
+    close(); onDone && onDone()
+  }
+}
+
+/* pick more Vault clips to attach to an existing piece */
+async function openSourcePicker(contentId, onDone) {
+  let vault = []
+  try { vault = (await api('/api/vault')).assets || [] } catch (e) { vault = [] }
+  const pickable = vault.filter((a) => a.kind === 'clip' || a.kind === 'photo')
+  const picked = new Set()
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal st-composer">
+    <div class="modal__h"><div class="t-h2">Add source clips</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      ${pickable.length
+        ? `<div class="st-pick">${pickable.map(composerTile).join('')}</div>
+           <div class="st-pick-note"><span id="st-picksum2">0 selected</span> from the Vault.</div>`
+        : `<div class="st-pick-empty">No photos or clips in the Vault yet.</div>`}
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="st-attach">${I.plus} Attach</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  const sum = $('#st-picksum2', wrap)
+  wrap.querySelectorAll('[data-pick]').forEach((el) => (el.onclick = () => {
+    const id = el.dataset.pick
+    if (picked.has(id)) { picked.delete(id); el.classList.remove('on') } else { picked.add(id); el.classList.add('on') }
+    if (sum) sum.textContent = `${picked.size} selected`
+  }))
+  $('#st-attach', wrap).onclick = async () => {
+    if (!picked.size) return close()
+    await api(`/api/content/${contentId}/assets`, { method: 'POST', body: JSON.stringify({ asset_ids: [...picked].map(Number) }) })
+    close(); onDone && onDone()
   }
 }
 
@@ -1278,11 +1735,25 @@ function calChargeOf(j) { return j.charge || j.est_value || 0 }
 
 /* ===================== CALENDAR ===================== */
 let _calFrom = todayIso()
+let _calMode = 'jobs'   // 'jobs' (booked work) | 'content' (scheduled posts) — Phase-3 toggle
+function calToggle() {
+  return `<div class="seg cal-mode">
+    <button class="${_calMode === 'jobs' ? 'on' : ''}" data-cal-mode="jobs">${I.today} Jobs</button>
+    <button class="${_calMode === 'content' ? 'on' : ''}" data-cal-mode="content">${I.spark} Content</button>
+  </div>`
+}
+function bindCalNav() {
+  app.querySelectorAll('[data-cal-mode]').forEach((b) => (b.onclick = () => { _calMode = b.dataset.calMode; renderApp('calendar') }))
+  const ct = $('#cal-today'); if (ct) ct.onclick = () => { _calFrom = todayIso(); renderApp('calendar') }
+  const cp = $('#cal-prev'); if (cp) cp.onclick = () => { _calFrom = shiftIso(_calFrom, -14); renderApp('calendar') }
+  const cn = $('#cal-next'); if (cn) cn.onclick = () => { _calFrom = shiftIso(_calFrom, 14); renderApp('calendar') }
+}
 async function viewCalendar() {
+  if (_calMode === 'content') return viewContentCalendar()
   const d = await api(`/api/calendar?from=${encodeURIComponent(_calFrom)}&days=14`)
   const grid = d.grid || [], s = d.summary || {}
   const tr = $('.topbar .right')
-  if (tr) tr.innerHTML = `<div class="cal-nav">
+  if (tr) tr.innerHTML = `${calToggle()}<div class="cal-nav">
       <button class="btn ghost sm" id="cal-prev">${I.arrow}<span class="cal-flip">${I.arrow}</span></button>
       <button class="btn ghost sm" id="cal-today">Today</button>
       <button class="btn ghost sm" id="cal-next">${I.arrow}</button>
@@ -1310,10 +1781,70 @@ async function viewCalendar() {
     if (j) openSchedule(j)
   }))
   const cad = $('#cal-add'); if (cad) cad.onclick = openAddLead
-  const ct = $('#cal-today'); if (ct) ct.onclick = () => { _calFrom = todayIso(); renderApp('calendar') }
-  const cp = $('#cal-prev'); if (cp) cp.onclick = () => { _calFrom = shiftIso(_calFrom, -14); renderApp('calendar') }
-  const cn = $('#cal-next'); if (cn) cn.onclick = () => { _calFrom = shiftIso(_calFrom, 14); renderApp('calendar') }
+  bindCalNav()
 }
+
+/* --- Calendar · CONTENT mode: scheduled posts grouped by day, channel-colored chips --- */
+async function viewContentCalendar() {
+  const d = await api(`/api/calendar/content?from=${encodeURIComponent(_calFrom)}&days=14`)
+  const grid = d.grid || [], s = d.summary || {}
+  const tr = $('.topbar .right')
+  if (tr) tr.innerHTML = `${calToggle()}<div class="cal-nav">
+      <button class="btn ghost sm" id="cal-prev">${I.arrow}<span class="cal-flip">${I.arrow}</span></button>
+      <button class="btn ghost sm" id="cal-today">Today</button>
+      <button class="btn ghost sm" id="cal-next">${I.arrow}</button>
+    </div><button class="btn primary sm" id="cc-new">${I.plus} New piece</button>`
+  const tot = grid.reduce((a, g) => a + (g.count || 0), 0)
+  const posted = grid.reduce((a, g) => a + (g.pieces || []).filter((p) => p.stage === 'posted').length, 0)
+  // overlay the 4-pillar cadence so empty pillar-days read as gaps
+  const PILLARS = { 1: 'Detective', 3: 'Real-job', 5: 'Honest', 0: 'Teach' }
+  setView(`
+    <div class="brief"><span class="tag">${I.spark} Your posting week</span>
+      <p>Cadence is the voice — one a day beats ten in a burst. Here's what's scheduled to go out over the next two weeks. Empty pillar-days (Mon detective · Wed real-job · Fri honest · Sun teach) glow as gaps to fill. Tap a card to open it in the Studio and post.</p></div>
+    <div class="kpis">
+      <div class="kpi primary"><div class="lab">Scheduled</div><div class="val">${tot}</div><div class="meta">next 14 days</div></div>
+      <div class="kpi"><div class="lab">Posted</div><div class="val">${posted}</div><div class="meta">already live</div></div>
+      <div class="kpi"><div class="lab">Empty days</div><div class="val">${s.open_days != null ? s.open_days : grid.filter((g) => !g.count).length}</div><div class="meta">nothing planned</div></div>
+      <div class="kpi"><div class="lab">Pillars</div><div class="val" style="font-size:15px">4 / week</div><div class="meta">Det · Job · Honest · Teach</div></div>
+    </div>
+    <div class="sec-h"><span class="label">Two-week posting view</span><span class="ct">${calLabel(grid.length ? grid[0].date : _calFrom)}${grid.length ? ' – ' + calLabel(grid[grid.length - 1].date) : ''}</span></div>
+    <div class="cal-grid">${grid.map((g) => ccDay(g, PILLARS)).join('')}</div>
+  `)
+  app.querySelectorAll('[data-cc-piece]').forEach((el) => (el.onclick = () => openPieceDrawer(el.dataset.ccPiece)))
+  const nw = $('#cc-new'); if (nw) nw.onclick = () => openContentComposer()
+  bindCalNav()
+}
+function ccDay(g, PILLARS) {
+  const p = dayParts(g.date)
+  const today = g.date === todayIso()
+  const pieces = g.pieces || []
+  const pillar = PILLARS[g.dow]
+  const gap = pillar && !pieces.length
+  const isWknd = p.dow === 'Sat' || p.dow === 'Sun'
+  return `<div class="cal-day ${today ? 'today' : ''} ${isWknd ? 'wknd' : ''} ${gap ? 'cc-gap' : ''}">
+    <div class="cal-day__h">
+      <div class="cal-dow">${esc(p.dow)}</div>
+      <div class="cal-date">${p.num}</div>
+      ${pillar ? `<div class="cc-pillar ${gap ? 'gap' : ''}">${esc(pillar)}</div>` : (pieces.length ? `<div class="cal-cap some">${pieces.length}</div>` : '')}
+    </div>
+    <div class="cal-day__b">
+      ${pieces.length ? pieces.map(ccChip).join('') : (gap ? `<div class="cc-gap-note">${esc(pillar)} day — open</div>` : `<div class="cal-free">—</div>`)}
+    </div>
+  </div>`
+}
+function ccChip(p) {
+  const chs = (p.channels || []).slice(0, 3)
+  const posted = p.stage === 'posted'
+  const thumb = p.thumb_url
+  return `<div class="cc-chip ${posted ? 'posted' : ''}" data-cc-piece="${p.id}" title="${esc(p.title || '')}">
+    ${thumb ? `<span class="cc-thumb"><img src="${esc(thumb)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')"></span>` : `<span class="cc-thumb ph">${I.spark}</span>`}
+    <div class="cc-chip__b">
+      <div class="cc-chip__t">${esc(p.title || 'Untitled')}</div>
+      <div class="cc-chip__ch">${chs.length ? chs.map((c) => `<span class="cc-ch ${esc(c)}">${esc(channelShort(c))}</span>`).join('') : '<span class="cc-ch none">no channel</span>'}${posted ? `<span class="cc-live">${I.check} live</span>` : ''}</div>
+    </div>
+  </div>`
+}
+function channelShort(ch) { const m = { instagram: 'IG', tiktok: 'TT', youtube: 'YT', gbp: 'GBP', facebook: 'FB', reel: 'Reel' }; return m[String(ch).toLowerCase()] || ch }
 function shiftIso(iso, days) { const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() + days); return isoDay(d) }
 function calLabel(iso) { if (!iso) return ''; const p = dayParts(iso); return p.mon + ' ' + p.num }
 function calDay(g) {
@@ -1392,10 +1923,11 @@ function openSchedule(j) {
 
 /* ===================== FIELD (sources + reputation + momentum) ===================== */
 async function viewField() {
-  const [src, mkt, mom] = await Promise.all([
+  const [src, mkt, mom, fun] = await Promise.all([
     api('/api/sources').catch(() => ({ sources: [], totals: {} })),
     api('/api/market').catch(() => ({ reputation: {}, recent_proof: [], market_notes: '' })),
     api('/api/momentum').catch(() => ({ trend: [], summary: {} })),
+    api('/api/funnel').catch(() => ({ funnel: [], channels: [], totals: {}, honest: {} })),
   ])
   const sources = src.sources || [], st = src.totals || {}, best = src.best
   const rep = mkt.reputation || {}, recent = mkt.recent_proof || []
@@ -1441,6 +1973,8 @@ async function viewField() {
       </div>`
       : emptyState('No sources to read yet', 'As leads come in tagged by where they came from — website, the AI widget, referrals, phone — this breaks down which funnel actually turns into paid jobs.')}
 
+    ${contentFunnelSection(fun)}
+
     <div class="sec-h"><span class="label">Reputation</span><span class="ct">${rep.proof_count || 0} on the wall</span></div>
     <div class="kpis">
       <div class="kpi primary"><div class="lab">Reviews</div><div class="val">${rep.reviews_count || 0}${rep.reviews_target ? ` <span style="font-size:12px;color:var(--fg4)">/ ${rep.reviews_target}</span>` : ''}</div><div class="meta">${rep.gbp_claimed ? 'Google profile claimed' : 'claim your Google profile'}</div></div>
@@ -1464,6 +1998,7 @@ async function viewField() {
     </div>
   `)
   app.querySelectorAll('.field-proof-row[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  const gs = $('#field-studio'); if (gs) gs.onclick = () => renderApp('content')
   const gp = $('#field-proof'); if (gp) gp.onclick = () => renderApp('proof')
   const save = $('#mkt-save'); if (save) save.onclick = async () => {
     save.disabled = true
@@ -1527,6 +2062,51 @@ function fieldProofRow(p) {
     <div class="grow"><div class="nm">${esc(p.author || p.customer || 'Anonymous')} ${stars(p.stars)}</div>
       <div class="sub field-proof-text">${esc(p.text || '')}</div></div>
     <span class="age-tag">${ago(p.created_at)}</span>
+  </div>`
+}
+
+/* --- the CONTENT FUNNEL (Phase 3) — Posts -> Reach -> Leads -> Booked -> Revenue + per-channel $/post --- */
+function contentFunnelSection(fun) {
+  const f = fun || {}, steps = f.funnel || [], channels = f.channels || [], t = f.totals || {}, honest = f.honest || {}
+  const hasAny = (t.posts || 0) + (t.planned || 0) + (t.reach || 0) + (t.leads || 0) + (t.pieces || 0) > 0
+  return `
+    <div class="sec-h"><span class="label">What content actually pulls</span><span class="ct">${t.posts || 0} posted · ${t.planned || 0} planned</span></div>
+    ${hasAny ? `
+      <div class="panel cf-panel">
+        <div class="cf-chain">${steps.map((s, i) => cfStep(s, i, steps)).join('')}</div>
+        ${honest.note ? `<div class="cf-note">${I.bolt}<span>${esc(honest.note)}</span></div>` : ''}
+        ${channels.length ? `
+          <div class="cf-table">
+            <div class="cf-row cf-head"><span class="cf-ch">Channel</span><span>Posts</span><span>Reach</span><span>Leads</span><span class="cf-rev">$/post</span></div>
+            ${channels.map((ch) => cfChannelRow(ch, channels, t)).join('')}
+          </div>` : `<div class="cf-empty-mini">Schedule a Ready piece to channels in the Studio and they show up here, ranked by what pays.</div>`}
+        <div class="cf-foot">
+          <span class="cf-revtot">${money(t.revenue)} attributed to content${t.booked ? ` · ${t.booked} booked` : ''}${t.revenue_per_post ? ` · ${money(t.revenue_per_post)}/post` : ''}</span>
+          <button class="btn ghost sm" id="field-studio">${I.arrow} Open the Studio</button>
+        </div>
+      </div>`
+      : emptyState('No content in the funnel yet', 'Cut a clip into a post in the Studio, schedule it to a channel, and post it. As you log reach + the leads each post pulls, this chain shows you exactly which channel turns footage into booked jobs.')}
+  `
+}
+function cfStep(s, i, steps) {
+  const prev = i > 0 ? steps[i - 1] : null
+  const val = Number(s.value || 0)
+  const conv = prev && Number(prev.value) > 0 ? Math.round((val / Number(prev.value)) * 100) : null
+  return `<div class="cf-step">
+    ${i > 0 ? `<span class="cf-arrow">${I.arrow}${conv != null ? `<i class="cf-conv">${conv}%</i>` : ''}</span>` : ''}
+    <div class="cf-cell"><div class="cf-val num">${s.money ? money(val) : val.toLocaleString()}</div><div class="cf-lab">${esc(s.stage)}</div></div>
+  </div>`
+}
+function cfChannelRow(ch, channels, t) {
+  const maxReach = Math.max(1, ...channels.map((x) => x.reach || 0))
+  const w = Math.max(2, Math.round(((ch.reach || 0) / maxReach) * 100))
+  // $/post per channel is honest-zero for organic; show a dash until revenue is actually attributable per channel
+  return `<div class="cf-row">
+    <span class="cf-ch">${esc(channelLabel(ch.channel))}${ch.planned ? `<span class="cf-planned">${ch.planned} planned</span>` : ''}</span>
+    <span class="num">${ch.posts || 0}</span>
+    <span class="num"><span class="cf-bar"><i style="width:${w}%"></i></span>${(ch.reach || 0).toLocaleString()}</span>
+    <span class="num ${ch.leads ? 'good' : ''}">${ch.leads || 0}</span>
+    <span class="cf-rev num">${ch.posts ? '$0' : '—'}</span>
   </div>`
 }
 
@@ -1744,6 +2324,373 @@ function openHandoffNew() {
     await api('/api/handoffs', { method: 'POST', body: JSON.stringify({ kind: $('#ho-kind', wrap).value, title, payload: note ? { note } : undefined }) })
     close(); renderApp('handoffs')
   }
+}
+
+/* ===================== CONTENT STUDIO Phase 1 · THE VAULT ===================== */
+/* One place to dump it all, from any device. Bytes go browser→R2 direct (presigned
+   PUT / multipart); Railway only brokers tickets + holds rows. Previews/downloads are
+   fresh short-lived signed GETs. Paste-a-link (Drive/YouTube) kept as a fallback. */
+const VAULT_KINDS = [['', 'All'], ['photo', 'Photos'], ['clip', 'Clips'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['doc', 'Docs']]
+const MP_THRESHOLD = 100 * 1024 * 1024            // ≥100MB → multipart (big GoPro/4K)
+const MP_PART = 8 * 1024 * 1024                    // ~8MB parts
+const MP_PARALLEL = 3                              // parts in flight at once
+const _vaultFilter = { kind: '', q: '' }
+let _vaultStorage = false                          // R2 wired? (drives upload vs paste-only)
+let _vaultUploads = []                             // live upload rows in the tray
+let _vaultUid = 0
+
+function fmtBytes(n) {
+  n = Number(n || 0); if (!n) return ''
+  if (n < 1024) return n + ' B'
+  if (n < 1048576) return (n / 1024).toFixed(0) + ' KB'
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB'
+  return (n / 1073741824).toFixed(2) + ' GB'
+}
+function fmtDur(s) {
+  s = Math.round(Number(s || 0)); if (!s) return ''
+  const m = Math.floor(s / 60), r = s % 60
+  return m + ':' + String(r).padStart(2, '0')
+}
+const kindOfFile = (f) => /^video\//.test(f.type) ? 'clip' : /^image\//.test(f.type) ? 'photo' : 'doc'
+
+async function viewVault() {
+  const tr = $('.topbar .right')
+  if (tr) tr.innerHTML = `
+    <input class="input vault-search" id="vault-q" placeholder="Search label, tag, caption…" autocomplete="off" value="${esc(_vaultFilter.q)}">
+    <button class="btn ghost sm" id="vault-link">${I.arrow} Paste link</button>
+    <button class="btn primary sm" id="vault-pick">${I.plus} Upload</button>`
+  setView(`
+    <input type="file" id="vault-file" accept="image/*,video/*" multiple hidden>
+    <div class="vault-drop" id="vault-drop">
+      <div class="vault-drop__ic">${I.spark}</div>
+      <div class="vault-drop__t">Dump it all here</div>
+      <div class="vault-drop__s">Drag photos &amp; clips in, or tap to grab them straight off your camera roll. Goes to one shelf, on every device.</div>
+      <button class="btn primary sm" id="vault-pick2">${I.plus} Choose files</button>
+    </div>
+    <div class="vault-tray" id="vault-tray"></div>
+    <div id="vault-wrap"><div class="loading">Loading…</div></div>`)
+  // wire pickers + drag-drop
+  const fileInput = $('#vault-file')
+  const pick = () => fileInput.click()
+  $('#vault-pick') && ($('#vault-pick').onclick = pick)
+  $('#vault-pick2') && ($('#vault-pick2').onclick = pick)
+  $('#vault-link') && ($('#vault-link').onclick = () => openVaultLink())
+  fileInput.onchange = () => { if (fileInput.files.length) queueUploads([...fileInput.files]); fileInput.value = '' }
+  const drop = $('#vault-drop')
+  if (drop) {
+    ;['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over') }))
+    ;['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'dragleave' && drop.contains(e.relatedTarget)) return; drop.classList.remove('over') }))
+    drop.addEventListener('drop', (e) => { const fs = [...(e.dataTransfer?.files || [])]; if (fs.length) queueUploads(fs) })
+  }
+  const sb = $('#vault-q')
+  if (sb) { let t; sb.oninput = () => { clearTimeout(t); t = setTimeout(() => { _vaultFilter.q = sb.value.trim(); loadVault() }, 240) } }
+  renderTray()
+  await loadVault()
+}
+
+async function loadVault() {
+  const host = $('#vault-wrap'); if (!host) return
+  const qs = []
+  if (_vaultFilter.kind) qs.push('kind=' + encodeURIComponent(_vaultFilter.kind))
+  if (_vaultFilter.q) qs.push('q=' + encodeURIComponent(_vaultFilter.q))
+  let d; try { d = await api('/api/vault' + (qs.length ? '?' + qs.join('&') : '')) } catch (e) { d = { assets: [], by_kind: {} } }
+  const assets = d.assets || [], byKind = d.by_kind || {}
+  _vaultStorage = !!d.storage_configured
+  // reflect storage state on the dropzone (paste-only until R2 is wired)
+  const drop = $('#vault-drop')
+  if (drop) drop.classList.toggle('off', !_vaultStorage)
+  const ds = $('.vault-drop__s', drop || document)
+  if (ds && !_vaultStorage) ds.textContent = "Direct upload turns on the moment R2 storage is connected. Until then, paste a Drive/YouTube link from the top right."
+  const chips = VAULT_KINDS.map(([v, l]) => `<button class="lib-chip ${_vaultFilter.kind === v ? 'on' : ''}" data-vault-kind="${v}">${l}${v && byKind[v] ? ` <b>${byKind[v]}</b>` : ''}</button>`).join('')
+  host.innerHTML = `
+    <div class="lib-bar"><div class="lib-chips">${chips}</div>
+      <span class="vault-count">${d.total || assets.length} item${(d.total || assets.length) === 1 ? '' : 's'}</span></div>
+    ${assets.length
+      ? `<div class="lib-grid vault-grid">${assets.map(vaultTile).join('')}</div>`
+      : (_vaultFilter.q || _vaultFilter.kind
+          ? `<div class="empty" style="padding:var(--s7) 0"><div class="ic">${I.today}</div><div class="ttl">Nothing matches</div><div class="sub">Try a different word or clear the filter.</div></div>`
+          : emptyState('Vault is empty', 'Drop a clip or a photo up top — from your phone or this desktop — and it lands here, on one searchable shelf, ready to cut into content or show the next customer.'))}`
+  host.querySelectorAll('[data-vault-kind]').forEach((b) => (b.onclick = () => { _vaultFilter.kind = b.dataset.vaultKind; loadVault() }))
+  host.querySelectorAll('[data-vault-open]').forEach((el) => (el.onclick = () => {
+    const a = assets.find((x) => String(x.id) === el.dataset.vaultOpen); if (a) openVaultAsset(a)
+  }))
+}
+
+function vaultTile(a) {
+  const isImg = a.kind === 'photo'
+  const isClip = a.kind === 'clip'
+  // images: any preview is a valid <img>. clips: only a real poster (thumb_key) is — never put a video URL in <img>.
+  const imgThumb = isImg ? (a.thumb_url || a.preview_url || a.url) : (isClip && a.thumb_key ? a.thumb_url : null)
+  const sub = [a.customer, a.vehicle].filter(Boolean).join(' · ') || a.service || a.issue || (a.storage === 'link' ? 'pasted link' : 'unsorted')
+  const meta = [fmtBytes(a.bytes), a.created_at ? ago(a.created_at) + ' ago' : ''].filter(Boolean).join(' · ')
+  return `<div class="lib-tile vault-tile" data-vault-open="${a.id}">
+    <div class="lib-tile__media ${imgThumb ? '' : 'doc'} ${isClip ? 'clip' : ''}">
+      ${imgThumb
+        ? `<img src="${esc(imgThumb)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">`
+        : `<span class="lib-kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}
+      ${isClip ? `<span class="vault-play">${I.spark}</span>${a.duration_s ? `<span class="vault-dur">${fmtDur(a.duration_s)}</span>` : ''}` : ''}
+      ${a.is_before ? '<span class="lib-before">BEFORE</span>' : ''}
+      ${a.storage === 'link' ? '<span class="vault-src">LINK</span>' : ''}
+    </div>
+    <div class="lib-tile__meta">
+      <div class="lib-tile__lbl">${esc(a.label || a.kind || 'attachment')}</div>
+      <div class="lib-tile__sub">${esc(sub)}</div>
+      ${meta ? `<div class="vault-tile__meta">${esc(meta)}</div>` : ''}
+    </div>
+  </div>`
+}
+
+/* ---- per-asset preview drawer: signed full URL, delete, link-to-a-job ---- */
+async function openVaultAsset(a) {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><aside class="drawer vault-drawer">
+    <div class="drawer__h"><span class="pill" style="color:var(--fg2);background:var(--bg4)"><span class="dot"></span>${esc(a.kind || 'asset')}</span>
+      ${a.is_before ? '<span class="lib-before" style="position:static">BEFORE</span>' : ''}
+      <button class="drawer__close">${I.x}</button></div>
+    <div class="drawer__b">
+      <div class="vault-preview" id="vp"><div class="loading">Loading…</div></div>
+      <div><div class="t-h2">${esc(a.label || a.kind || 'Attachment')}</div>
+        <div style="color:var(--fg3);font-size:12px;margin-top:2px">${esc([a.customer, a.vehicle].filter(Boolean).join(' · ') || a.service || (a.storage === 'link' ? 'Pasted link' : 'Unsorted — not tied to a job yet'))}</div></div>
+      <div class="vault-facts">
+        ${a.bytes ? `<span class="vault-fact">${fmtBytes(a.bytes)}</span>` : ''}
+        ${a.duration_s ? `<span class="vault-fact">${fmtDur(a.duration_s)}</span>` : ''}
+        ${a.mime ? `<span class="vault-fact">${esc(a.mime)}</span>` : ''}
+        ${a.created_at ? `<span class="vault-fact">${ago(a.created_at)} ago</span>` : ''}
+      </div>
+      ${a.ai_caption ? `<div class="ai-read">${I.spark}<span>${esc(a.ai_caption)}</span></div>` : ''}
+      <div style="display:flex;gap:var(--s2);flex-wrap:wrap">
+        <a class="btn ghost sm" id="vp-open" target="_blank" rel="noopener">${I.arrow} Open / download</a>
+        ${a.job_id ? `<button class="btn ghost sm" id="vp-job">${I.pipeline} View job</button>` : `<button class="btn ghost sm" id="vp-link">${I.plus} Link to a job</button>`}
+        <button class="btn ghost sm vault-del" id="vp-del">${I.x} Delete</button>
+      </div>
+    </div></aside>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close; $('.drawer__close', wrap).onclick = close
+  // resolve a fresh full URL, then render the right preview element
+  let fullUrl = a.preview_url || a.url
+  try { const u = await api(`/api/assets/${a.id}/url`); if (u && u.url) fullUrl = u.url } catch (e) { /* fall back to preview */ }
+  const vp = $('#vp', wrap)
+  if (vp) {
+    if (a.kind === 'clip') vp.innerHTML = `<video src="${esc(fullUrl)}" controls playsinline preload="metadata" poster="${esc(a.thumb_url || '')}"></video>`
+    else if (a.kind === 'photo') vp.innerHTML = `<img src="${esc(fullUrl)}" alt="${esc(a.label || '')}" onerror="this.parentNode.classList.add('broken')">`
+    else vp.innerHTML = `<div class="vault-preview__doc"><span class="lib-kind">${esc((a.kind || 'doc').toUpperCase())}</span></div>`
+  }
+  const open = $('#vp-open', wrap); if (open) open.href = fullUrl
+  const vj = $('#vp-job', wrap); if (vj) vj.onclick = () => { close(); openJob(a.job_id) }
+  const vl = $('#vp-link', wrap); if (vl) vl.onclick = () => openLinkToJob(a, () => { close(); loadVault() })
+  const del = $('#vp-del', wrap); if (del) del.onclick = async () => {
+    if (!confirm('Delete this asset? This removes it from R2 too.')) return
+    del.disabled = true
+    await api(`/api/assets/${a.id}/delete`, { method: 'POST' })
+    close(); loadVault()
+  }
+}
+
+/* ---- link an unsorted asset to a job (re-record under the job) ---- */
+async function openLinkToJob(a, onDone) {
+  let jobs = []
+  try { jobs = (await api('/api/jobs')).jobs || [] } catch (e) { jobs = [] }
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Link to a job</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>Job</label>
+        <select class="input" id="ltj-job">${jobs.map((j) => `<option value="${j.id}">${esc([j.customer, j.vehicle, j.issue].filter(Boolean).join(' · ') || ('Job #' + j.id))}</option>`).join('') || '<option value="">No jobs yet</option>'}</select></div>
+      <div class="vault-note">Ties this clip/photo to the customer + vehicle so it shows on their job and in before/after.</div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="ltj-save">${I.check} Link it</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#ltj-save', wrap).onclick = async () => {
+    const jobId = $('#ltj-job', wrap).value; if (!jobId) return close()
+    // for R2 assets: re-record under the job (keeps the same object); then drop the old row.
+    if (a.storage === 'r2' && a.r2_key) {
+      await api('/api/uploads/record', { method: 'POST', body: JSON.stringify({ r2_key: a.r2_key, kind: a.kind, mime: a.mime || undefined, bytes: a.bytes || undefined, filename: a.label || undefined, job_id: Number(jobId), is_before: a.is_before }) })
+      await api(`/api/assets/${a.id}/delete`, { method: 'POST' })
+    } else {
+      // link asset: attach a fresh copy to the job via the legacy paste route, then drop the loose row
+      await api(`/api/jobs/${jobId}/assets`, { method: 'POST', body: JSON.stringify({ url: a.url, kind: a.kind, label: a.label || undefined, is_before: a.is_before }) })
+      await api(`/api/assets/${a.id}/delete`, { method: 'POST' })
+    }
+    close(); onDone && onDone()
+  }
+}
+
+/* ---- paste-a-link fallback (Drive / YouTube / PDF) — storage='link' ----
+   The link path reuses the legacy per-job assets route (which is the only insert
+   for storage='link'), so a link is attached to a job. Photos/clips belong up top. */
+async function openVaultLink() {
+  let jobs = []
+  try { jobs = (await api('/api/jobs')).jobs || [] } catch (e) { jobs = [] }
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">Paste a link</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>URL</label><input class="input" id="vl-url" placeholder="https://… (Drive, YouTube, PDF)"></div>
+      <div class="vault-add__row">
+        <select class="input" id="vl-kind">${ASSET_KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
+        <input class="input" id="vl-label" placeholder="Label (optional)">
+      </div>
+      <div class="field"><label>Attach to job</label>
+        <select class="input" id="vl-job">${jobs.map((j) => `<option value="${j.id}">${esc([j.customer, j.vehicle, j.issue].filter(Boolean).join(' · ') || ('Job #' + j.id))}</option>`).join('') || '<option value="">No jobs yet — add a lead first</option>'}</select></div>
+      <label class="as-check"><input type="checkbox" id="vl-before"> <span>This is a "before" shot</span></label>
+      <div class="vault-note">For files you'd rather keep on Drive/YouTube. Photos &amp; clips are better dumped straight up top — they get a real thumbnail and live on R2.</div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn primary" id="vl-save">${I.plus} Add link</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#vl-save', wrap).onclick = async () => {
+    const url = $('#vl-url', wrap).value.trim(); if (!url) return
+    const jobId = $('#vl-job', wrap).value; if (!jobId) { alert('Add a lead first, then a link can hang off the job.'); return }
+    await api(`/api/jobs/${jobId}/assets`, { method: 'POST', body: JSON.stringify({ url, kind: $('#vl-kind', wrap).value, label: $('#vl-label', wrap).value.trim() || undefined, is_before: $('#vl-before', wrap).checked }) })
+    close(); loadVault()
+  }
+}
+
+/* ================= UPLOAD ENGINE (browser → R2 direct, real progress) ================= */
+function renderTray() {
+  const tray = $('#vault-tray'); if (!tray) return
+  const live = _vaultUploads.filter((u) => u.status !== 'gone')
+  if (!live.length) { tray.innerHTML = ''; return }
+  const anyBig = live.some((u) => u.size >= MP_THRESHOLD && u.status === 'uploading')
+  tray.innerHTML = `
+    <div class="vault-tray__h"><span class="label">Uploading · ${live.filter((u) => u.status === 'uploading').length} active</span>
+      ${anyBig ? `<span class="vault-keep">Keep this tab open while big videos finish</span>` : ''}
+      <button class="vault-tray__clear" id="vault-clear">Clear done</button></div>
+    ${live.map((u) => `
+      <div class="vup ${u.status}">
+        <span class="vup__ic">${u.status === 'done' ? I.check : u.status === 'error' ? I.x : I.spark}</span>
+        <div class="vup__body">
+          <div class="vup__name">${esc(u.name)} <span class="vup__sz">${fmtBytes(u.size)}${u.size >= MP_THRESHOLD ? ' · multipart' : ''}</span></div>
+          <div class="vup__bar"><i style="width:${Math.round(u.pct)}%"></i></div>
+        </div>
+        <span class="vup__pct">${u.status === 'done' ? 'Done' : u.status === 'error' ? 'Failed' : Math.round(u.pct) + '%'}</span>
+        ${u.status === 'uploading' ? `<button class="vup__x" data-vup-cancel="${u.id}" title="Cancel">${I.x}</button>` : u.status === 'error' ? `<button class="vup__x retry" data-vup-retry="${u.id}" title="Retry">${I.arrow}</button>` : ''}
+      </div>`).join('')}`
+  const clr = $('#vault-clear'); if (clr) clr.onclick = () => { _vaultUploads = _vaultUploads.filter((u) => u.status === 'uploading'); renderTray() }
+  tray.querySelectorAll('[data-vup-cancel]').forEach((b) => (b.onclick = () => cancelUpload(b.dataset.vupCancel)))
+  tray.querySelectorAll('[data-vup-retry]').forEach((b) => (b.onclick = () => { const u = _vaultUploads.find((x) => String(x.id) === b.dataset.vupRetry); if (u) startUpload(u) }))
+}
+function setUp(u, patch) { Object.assign(u, patch); renderTray() }
+
+function queueUploads(files) {
+  if (!_vaultStorage) { alert('Direct upload turns on once R2 storage is connected. Use "Paste link" for now.'); return }
+  for (const f of files) {
+    const u = { id: ++_vaultUid, file: f, name: f.name, size: f.size, type: f.type || 'application/octet-stream', kind: kindOfFile(f), pct: 0, status: 'uploading', xhr: null, aborted: false, mp: null }
+    _vaultUploads.unshift(u); startUpload(u)
+  }
+  renderTray()
+}
+async function startUpload(u) {
+  setUp(u, { status: 'uploading', pct: 0, aborted: false })
+  try {
+    if (u.size >= MP_THRESHOLD) await uploadMultipart(u)
+    else await uploadSingle(u)
+    if (u.aborted) return
+    // record the row (storage='r2'); then refresh the grid
+    const dur = u.kind === 'clip' ? await probeDuration(u.file).catch(() => null) : null
+    await api('/api/uploads/record', { method: 'POST', body: JSON.stringify({ r2_key: u.r2_key, kind: u.kind, mime: u.type, bytes: u.size, filename: u.name, duration_s: dur || undefined }) })
+    setUp(u, { status: 'done', pct: 100 })
+    loadVault()
+  } catch (e) {
+    if (u.aborted) return
+    console.error('[upload]', e && e.message)
+    setUp(u, { status: 'error' })
+  }
+}
+
+// XHR PUT with real progress; resolves on 2xx, rejects otherwise (so we can retry just this PUT)
+function putWithProgress(url, body, contentType, onPct, hold) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    if (hold) hold.xhr = xhr
+    xhr.open('PUT', url, true)
+    if (contentType) xhr.setRequestHeader('Content-Type', contentType)
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onPct) onPct(e.loaded / e.total) }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve({ etag: xhr.getResponseHeader('ETag') })
+      else reject(new Error('PUT ' + xhr.status))
+    }
+    xhr.onerror = () => reject(new Error('network'))
+    xhr.onabort = () => reject(new Error('aborted'))
+    xhr.send(body)
+  })
+}
+
+async function uploadSingle(u) {
+  const sign = await api('/api/uploads/sign', { method: 'POST', body: JSON.stringify({ filename: u.name, content_type: u.type, size: u.size, kind: u.kind }) })
+  if (!sign || !sign.url) throw new Error(sign && sign.error || 'sign failed')
+  u.r2_key = sign.r2_key
+  await putWithProgress(sign.url, u.file, sign.content_type || u.type, (p) => { if (!u.aborted) setUp(u, { pct: p * 100 }) }, u)
+}
+
+async function uploadMultipart(u) {
+  const create = await api('/api/uploads/multipart/create', { method: 'POST', body: JSON.stringify({ filename: u.name, content_type: u.type, kind: u.kind }) })
+  if (!create || !create.uploadId) throw new Error(create && create.error || 'create failed')
+  u.r2_key = create.r2_key; u.mp = { uploadId: create.uploadId }
+  const total = Math.ceil(u.size / MP_PART)
+  const parts = []                 // [{PartNumber, ETag}]
+  const progress = new Array(total).fill(0)
+  const bump = () => { if (!u.aborted) setUp(u, { pct: (progress.reduce((a, b) => a + b, 0) / total) * 100 }) }
+  let next = 1
+  const worker = async () => {
+    while (next <= total) {
+      if (u.aborted) return
+      const partNumber = next++
+      const start = (partNumber - 1) * MP_PART
+      const blob = u.file.slice(start, Math.min(start + MP_PART, u.size))   // never buffer the whole file
+      await uploadOnePart(u, partNumber, blob, (p) => { progress[partNumber - 1] = p; bump() }, parts)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(MP_PARALLEL, total) }, worker))
+  if (u.aborted) return
+  const out = await api('/api/uploads/multipart/complete', { method: 'POST', body: JSON.stringify({ r2_key: u.r2_key, uploadId: u.mp.uploadId, parts }) })
+  if (!out || !out.ok) throw new Error(out && out.error || 'complete failed')
+}
+
+async function uploadOnePart(u, partNumber, blob, onPct, parts) {
+  let lastErr
+  for (let attempt = 0; attempt < 3; attempt++) {       // retry ONLY this part on flaky LTE
+    if (u.aborted) return
+    try {
+      const s = await api('/api/uploads/multipart/sign', { method: 'POST', body: JSON.stringify({ r2_key: u.r2_key, uploadId: u.mp.uploadId, partNumber }) })
+      if (!s || !s.url) throw new Error(s && s.error || 'sign part failed')
+      const res = await putWithProgress(s.url, blob, null, onPct)
+      const etag = res.etag || ''
+      parts.push({ PartNumber: partNumber, ETag: etag })
+      onPct(1)
+      return
+    } catch (e) { lastErr = e; onPct(0); await new Promise((r) => setTimeout(r, 600 * (attempt + 1))) }
+  }
+  throw lastErr || new Error('part ' + partNumber + ' failed')
+}
+
+function cancelUpload(id) {
+  const u = _vaultUploads.find((x) => String(x.id) === String(id)); if (!u) return
+  u.aborted = true
+  try { u.xhr && u.xhr.abort() } catch (e) { /* noop */ }
+  if (u.mp && u.r2_key) api('/api/uploads/multipart/abort', { method: 'POST', body: JSON.stringify({ r2_key: u.r2_key, uploadId: u.mp.uploadId }) }).catch(() => {})
+  u.status = 'gone'; renderTray()
+}
+
+// read a clip's duration locally (no upload needed) for the asset row
+function probeDuration(file) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement('video')
+    v.preload = 'metadata'; v.muted = true
+    const url = URL.createObjectURL(file)
+    const done = (val) => { URL.revokeObjectURL(url); resolve(val) }
+    v.onloadedmetadata = () => done(isFinite(v.duration) ? Math.round(v.duration) : null)
+    v.onerror = () => { URL.revokeObjectURL(url); reject(new Error('probe')) }
+    v.src = url
+  })
 }
 
 if (token) renderApp('pulse'); else renderLogin()
