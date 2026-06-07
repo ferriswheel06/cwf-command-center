@@ -124,6 +124,10 @@ const MIGRATIONS = [
   `alter table content add column if not exists channel text`,
   `alter table content add column if not exists posted_at timestamptz`,
   `create index if not exists content_business_idx on content (business_id, created_at desc)`,
+  `alter table jobs add column if not exists scheduled_time text`,
+  `alter table jobs add column if not exists duration_min int`,
+  `create index if not exists jobs_scheduled_date_idx on jobs (business_id, scheduled_date)`,
+  `insert into settings (business_id,key,value) values (1,'market_notes','{"notes":""}'::jsonb) on conflict (business_id,key) do nothing`,
 ]
 
 export async function applySchema() {

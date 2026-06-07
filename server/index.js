@@ -865,6 +865,185 @@ app.post('/api/content/:id/delete', auth, async (c) => {
 })
 
 
+// ============================================================================
+// WAVE 5 — "See the field": book the week without double-booking, learn which
+// funnel actually pays, keep proof + the local read in one place, and watch
+// the energy score move over time. Tenant-scoped via biz(c). Flat price, no tax.
+// ============================================================================
+
+// ---- BOOKING CALENDAR + CAPACITY — see the week, don't double-book ----
+// Window of ~14 days from today (or ?from=YYYY-MM-DD), scheduled jobs grouped by day with a per-day count.
+app.get('/api/calendar', auth, async (c) => {
+  const b = biz(c)
+  const fromRaw = (c.req.query('from') || '').toString().trim()
+  const days = Math.max(1, Math.min(31, Number(c.req.query('days')) || 14))
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(fromRaw) ? fromRaw : new Date().toISOString().slice(0, 10)
+  const rows = (await q(`select j.id, j.status, j.issue, j.service, j.scheduled_date, j.scheduled_time, j.duration_min,
+      j.charge, j.ticket_tier, j.safety_flag,
+      coalesce(j.charge,0)-coalesce(j.parts_cost,0)-coalesce(j.gas_cost,0) as profit,
+      c.name as customer, c.phone, c.location,
+      nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id
+    where j.business_id=$1 and j.scheduled_date is not null
+      and j.scheduled_date >= $2::date and j.scheduled_date < ($2::date + $3::int)
+    order by j.scheduled_date asc, j.scheduled_time asc nulls last, j.created_at asc`, [b, from, days])).rows
+  // build a contiguous day grid so empty days still render
+  const byDay = {}
+  for (const r of rows) {
+    const key = new Date(r.scheduled_date).toISOString().slice(0, 10)
+    if (!byDay[key]) byDay[key] = []
+    byDay[key].push({ ...r, profit: Number(r.profit) || 0, below_floor: (Number(r.profit) || 0) < 1000 })
+  }
+  const start = new Date(from + 'T00:00:00.000Z')
+  const grid = []
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start.getTime() + i * 86400000)
+    const key = d.toISOString().slice(0, 10)
+    const jobs = byDay[key] || []
+    grid.push({
+      date: key,
+      dow: d.getUTCDay(),
+      jobs,
+      booked: jobs.length,
+      booked_value: jobs.reduce((s, x) => s + (Number(x.charge) || 0), 0),
+    })
+  }
+  const summary = {
+    from,
+    days,
+    total_booked: rows.length,
+    busiest: grid.reduce((mx, g) => (g.booked > (mx?.booked || 0) ? g : mx), null)?.date || null,
+    open_days: grid.filter((g) => g.booked === 0).length,
+  }
+  return c.json({ grid, summary })
+})
+
+// Set / reschedule the date, time, and duration on a job — keeps status honest (a booked job is at least scheduled)
+app.post('/api/jobs/:id/schedule', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const job = (await q(`select j.status, c.name as customer from jobs j join customers c on c.id=j.customer_id
+      where j.id=$1 and j.business_id=$2`, [id, b])).rows[0]
+  if (!job) return c.json({ error: 'not found' }, 404)
+  const date = (d.scheduled_date || '').toString().trim()
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date must be YYYY-MM-DD' }, 400)
+  const time = d.scheduled_time != null ? (d.scheduled_time || '').toString().trim() || null : null
+  const dur = d.duration_min != null ? Math.max(0, Number(d.duration_min) || 0) : null
+  // booking a date moves a still-early job forward to scheduled (don't downgrade one already further along)
+  const bumps = ['lead', 'quoted'].includes(job.status) && !!date
+  const newStatus = bumps ? 'scheduled' : job.status
+  await q(`update jobs set scheduled_date=$1::date, scheduled_time=$2, duration_min=$3, status=$4 where id=$5 and business_id=$6`,
+    [date || null, time, dur, newStatus, id, b])
+  const when = date ? `${date}${time ? ` ${time}` : ''}` : 'cleared'
+  await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'schedule',$3)`,
+    [b, id, `Booked ${job.customer} → ${when}${dur ? ` (${dur} min)` : ''}`])
+  return c.json({ ok: true, scheduled_date: date || null, scheduled_time: time, duration_min: dur, status: newStatus })
+})
+
+// ---- FUNNEL SOURCE ATTRIBUTION — learn which funnel actually pays ----
+// Group every job by source: leads, paid, revenue, profit, conversion (paid/total).
+app.get('/api/sources', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select coalesce(nullif(trim(source),''),'unknown') as source,
+      count(*)::int as total,
+      count(*) filter (where status='lead')::int as leads,
+      count(*) filter (where status not in ('paid','lost'))::int as active,
+      count(*) filter (where status='lost')::int as lost,
+      count(*) filter (where status='paid')::int as paid,
+      coalesce(sum(charge) filter (where status='paid'),0)::float as revenue,
+      coalesce(sum(coalesce(charge,0)-coalesce(parts_cost,0)-coalesce(gas_cost,0)) filter (where status='paid'),0)::float as profit
+    from jobs where business_id=$1
+    group by 1
+    order by revenue desc, paid desc, total desc`, [b])).rows
+  const sources = rows.map((r) => ({
+    ...r,
+    avg_ticket: r.paid ? Math.round(r.revenue / r.paid) : 0,
+    conversion: r.total ? Math.round((r.paid / r.total) * 100) : 0,
+  }))
+  const totals = sources.reduce((t, s) => ({
+    total: t.total + s.total, leads: t.leads + s.leads, paid: t.paid + s.paid,
+    revenue: t.revenue + s.revenue, profit: t.profit + s.profit,
+  }), { total: 0, leads: 0, paid: 0, revenue: 0, profit: 0 })
+  totals.conversion = totals.total ? Math.round((totals.paid / totals.total) * 100) : 0
+  totals.avg_ticket = totals.paid ? Math.round(totals.revenue / totals.paid) : 0
+  // the funnel actually producing — best by revenue with at least one paid job
+  const best = sources.filter((s) => s.paid > 0)[0] || null
+  return c.json({ sources, totals, best })
+})
+
+// ---- REPUTATION + MARKET PULSE — proof + ask-rate in one place, plus a manual local read ----
+app.get('/api/market', auth, async (c) => {
+  const b = biz(c)
+  const signals = await getJson(b, 'signals', { gbp_claimed: false, reviews_count: 0, reviews_target: 10 })
+  const market = await getJson(b, 'market_notes', { notes: '' })
+  const m = (await q(`select
+      count(*) filter (where status in ('completed','paid'))::int as eligible,
+      count(*) filter (where status in ('completed','paid') and review_ask_sent_at is not null)::int as asked,
+      count(*) filter (where status in ('completed','paid') and review_received_at is not null)::int as received
+    from jobs where business_id=$1`, [b])).rows[0]
+  const askRate = m.eligible ? Math.round((m.asked / m.eligible) * 100) : 0
+  const gotRate = m.asked ? Math.round((m.received / m.asked) * 100) : 0
+  const proofCount = (await q(`select count(*)::int n from proof where business_id=$1`, [b])).rows[0].n
+  const recentProof = (await q(`select p.id, p.kind, p.author, p.text, p.stars, p.job_id, p.created_at,
+      c.name as customer
+    from proof p
+    left join jobs j on j.id=p.job_id and j.business_id=p.business_id
+    left join customers c on c.id=j.customer_id
+    where p.business_id=$1 order by p.created_at desc limit 8`, [b])).rows
+  return c.json({
+    reputation: {
+      reviews_count: Number(signals.reviews_count) || 0,
+      reviews_target: Number(signals.reviews_target) || 10,
+      gbp_claimed: !!signals.gbp_claimed,
+      proof_count: proofCount,
+      eligible: m.eligible, asked: m.asked, received: m.received,
+      ask_rate: askRate, got_rate: gotRate,
+    },
+    recent_proof: recentProof,
+    market_notes: (market.notes || '').toString(),
+  })
+})
+app.put('/api/market', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const notes = (d.notes || '').toString()
+  await setJson(b, 'market_notes', { notes, updated_at: new Date().toISOString() })
+  return c.json({ ok: true, notes })
+})
+
+// ---- MOMENTUM TREND — the energy score over time, watchable ----
+// Last 30 days of the daily snapshot: score + the 4 sub-scores, plus the delta.
+app.get('/api/momentum', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select day, score,
+      coalesce((breakdown->>'acquisition')::int,0) as acquisition,
+      coalesce((breakdown->>'conversion')::int,0) as conversion,
+      coalesce((breakdown->>'trust')::int,0) as trust,
+      coalesce((breakdown->>'cash')::int,0) as cash
+    from momentum where business_id=$1 and day > current_date - 30
+    order by day asc`, [b])).rows
+  const trend = rows.map((r) => ({
+    day: new Date(r.day).toISOString().slice(0, 10),
+    score: Number(r.score) || 0,
+    acquisition: Number(r.acquisition) || 0,
+    conversion: Number(r.conversion) || 0,
+    trust: Number(r.trust) || 0,
+    cash: Number(r.cash) || 0,
+  }))
+  const latest = trend.length ? trend[trend.length - 1] : null
+  const first = trend.length ? trend[0] : null
+  const prev = trend.length > 1 ? trend[trend.length - 2] : null
+  const score = latest ? latest.score : 0
+  const delta = latest && prev ? latest.score - prev.score : null
+  const delta_30d = latest && first ? latest.score - first.score : null
+  const label = score >= 66 ? 'Gaining' : score >= 33 ? 'Warming' : 'Bleeding'
+  const high = trend.reduce((mx, t) => Math.max(mx, t.score), 0)
+  const low = trend.length ? trend.reduce((mn, t) => Math.min(mn, t.score), 100) : 0
+  return c.json({
+    trend,
+    summary: { score, delta, delta_30d, label, days: trend.length, high, low, breakdown: latest ? { acquisition: latest.acquisition, conversion: latest.conversion, trust: latest.trust, cash: latest.cash } : null },
+  })
+})
+
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
