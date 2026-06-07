@@ -109,9 +109,12 @@ function goalBar(name, val, target, isMoney) {
     <div class="goal__track"><div class="goal__fill ${pct >= 100 ? 'over' : ''}" data-w="${pct}%" style="width:0"></div></div></div>`
 }
 function sparkline(trend) {
-  if (!trend || !trend.length) return `<div class="spark-empty">No history yet — your daily reads will plot here as the loop runs.</div>`
-  const max = Math.max(...trend.map((t) => t.score || 0), 1)
-  return `<div class="spark">${trend.map((t, i) => `<i class="${i === trend.length - 1 ? 'now' : ''}" style="height:${Math.max(5, Math.round(((t.score || 0) / max) * 44))}px"></i>`).join('')}</div>`
+  const slots = 14, data = (trend || []).slice(-slots)
+  if (!data.length) return `<div class="spark-empty">No history yet — your daily reads will plot here as the loop runs.</div>`
+  const max = Math.max(...data.map((t) => t.score || 0), 1), pad = slots - data.length, bars = []
+  for (let i = 0; i < pad; i++) bars.push(`<i style="height:4px;opacity:.18"></i>`)
+  data.forEach((t, i) => bars.push(`<i class="${i === data.length - 1 ? 'now' : ''}" style="height:${Math.max(5, Math.round(((t.score || 0) / max) * 44))}px"></i>`))
+  return `<div class="spark">${bars.join('')}</div>`
 }
 function needsPanel(n) {
   const rows = []
