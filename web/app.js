@@ -30,10 +30,10 @@ const NAV_GROUPS = [
   ['Acquire', [['pulse', 'Pulse', I.spark], ['triage', 'Triage', I.bolt]]],
   ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today], ['quotes', 'Quotes', I.money], ['customers', 'Customers', I.today], ['money', 'Money', I.money]]],
   ['Grow', [['field', 'Field', I.pipeline], ['activation', 'Activation', I.bolt], ['proof', 'Proof', I.check], ['content', 'Content', I.spark]]],
-  ['Plan', [['assets', 'Library', I.today], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
+  ['Plan', [['handoffs', 'To Claude Code', I.spark], ['assets', 'Library', I.today], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers', money: 'Money', field: 'Field', activation: 'Activation', proof: 'Proof', content: 'Content', assets: 'Asset library', templates: 'Templates', backburner: 'Back-burner' }
+const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers', money: 'Money', field: 'Field', activation: 'Activation', proof: 'Proof', content: 'Content', handoffs: 'To Claude Code', assets: 'Asset library', templates: 'Templates', backburner: 'Back-burner' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -89,6 +89,7 @@ else if (tab === 'content') await viewContent()
 else if (tab === 'assets') await viewAssets()
 else if (tab === 'calendar') await viewCalendar()
 else if (tab === 'field') await viewField()
+else if (tab === 'handoffs') await viewHandoffs()
   } catch (e) { /* 401 handled */ }
 }
 
@@ -177,8 +178,11 @@ async function viewPulse() {
     </div>
   `)
   bindRows()
+  // Map the one-move to its guided gate playbook — these are deep walk-throughs, not flag-flips.
+  const OM_GATE = { gbp: 'gbp', reviews: 'reviews', post: 'content' }
   const go = $('#om-go'); if (go) go.onclick = async () => {
     if (om.key === 'reply' && om.job_id) { openJob(om.job_id); return }
+    if (OM_GATE[om.key]) { openPlaybook(OM_GATE[om.key], { onClose: () => renderApp('pulse') }); return }
     await api('/api/pulse/action', { method: 'POST', body: JSON.stringify({ key: om.key }) }); renderApp('pulse')
   }
   setTimeout(() => {
@@ -279,32 +283,44 @@ async function viewMoney() {
   `)
 }
 
-/* ---------------- ACTIVATION ---------------- */
+/* ---------------- ACTIVATION (guided gates) ---------------- */
+// Each gate opens its real playbook — a step-by-step checklist with instructions,
+// snippets to copy, links to open, and steps you can hand to Claude Code. The
+// checklist drives the gate to done; the old status dropdown is now a tiny override.
 async function viewActivation() {
   const d = await api('/api/activation'); const items = d.items || []
   const done = items.filter((i) => i.status === 'done').length
+  const next = items.find((i) => i.status !== 'done')
   setView(`
     <div class="brief"><span class="tag">${I.bolt} The machine is built — this turns it ON</span>
-      <p>${done} of ${items.length} gates done. Each one you flip unlocks real leads. Top priority: send the 2 review-ask texts.</p></div>
-    <div class="sec-h"><span class="label">Activation gates</span></div>
+      <p>${done} of ${items.length} gates lit. These aren't checkboxes — tap one and it walks you through the actual moves, step by step, with the copy-paste and links right there.${next ? ` Do this next: <b>${esc(next.label)}</b>.` : ' Every gate is live — you’re fully on.'}</p></div>
+    <div class="sec-h"><span class="label">Activation gates</span><span class="ct">${done}/${items.length}</span></div>
     <div class="list">${items.map(actRow).join('')}</div>
   `)
+  const open = (el) => openPlaybook(el.dataset.actKey, { onClose: () => renderApp('activation') })
   app.querySelectorAll('[data-act]').forEach((el) => {
-    el.querySelector('.act__check').onclick = async () => {
+    el.onclick = (e) => { if (e.target.closest('.act__check') || e.target.closest('select')) return; open(el) }
+    el.querySelector('.act__check').onclick = (e) => {
+      e.stopPropagation()
       const cur = el.dataset.status; const nx = cur === 'done' ? 'todo' : 'done'
-      await api(`/api/activation/${el.dataset.act}`, { method: 'PATCH', body: JSON.stringify({ status: nx }) }); renderApp('activation')
+      api(`/api/activation/${el.dataset.act}`, { method: 'PATCH', body: JSON.stringify({ status: nx }) }).then(() => renderApp('activation'))
     }
-    el.querySelector('select').onchange = async (e) => { await api(`/api/activation/${el.dataset.act}`, { method: 'PATCH', body: JSON.stringify({ status: e.target.value }) }); renderApp('activation') }
+    const sel = el.querySelector('select')
+    if (sel) { sel.onclick = (e) => e.stopPropagation(); sel.onchange = async (e) => { e.stopPropagation(); await api(`/api/activation/${el.dataset.act}`, { method: 'PATCH', body: JSON.stringify({ status: e.target.value }) }); renderApp('activation') } }
   })
 }
 function actRow(it) {
   const on = it.status === 'done'
-  return `<div class="act ${on ? 'done' : ''}" data-act="${it.id}" data-status="${it.status}">
-    <div class="act__check ${on ? 'on' : ''}">${on ? I.check : ''}</div>
-    <div class="grow"><div class="nm">${esc(it.label)}</div><div class="un">${esc(it.unlocks || '')}</div></div>
-    <select><option value="todo" ${it.status === 'todo' ? 'selected' : ''}>To do</option>
+  const doing = it.status === 'doing'
+  return `<div class="act guided ${on ? 'done' : ''}" data-act="${it.id}" data-act-key="${esc(it.key)}" data-status="${it.status}">
+    <div class="act__check ${on ? 'on' : ''}" title="Manual override">${on ? I.check : ''}</div>
+    <div class="grow"><div class="nm">${esc(it.label)}</div><div class="un">${esc(it.unlocks || '')}</div>
+      ${doing ? `<div class="act-mini"><i style="width:50%"></i></div>` : ''}</div>
+    ${on ? '<span class="act-pct">done</span>' : doing ? '<span class="act-pct">in progress</span>' : ''}
+    <select title="Manual override"><option value="todo" ${it.status === 'todo' ? 'selected' : ''}>To do</option>
       <option value="doing" ${it.status === 'doing' ? 'selected' : ''}>Doing</option>
       <option value="done" ${it.status === 'done' ? 'selected' : ''}>Done</option></select>
+    <span class="act-open">${I.arrow}</span>
   </div>`
 }
 
@@ -1514,5 +1530,220 @@ function fieldProofRow(p) {
   </div>`
 }
 
+
+/* ===================== GUIDED PLAYBOOKS (gates made real) ===================== */
+/* A gate is no longer a flag-flip. Clicking one opens its playbook drawer:
+   a step-by-step checklist with the actual instructions, Copy snippets, Open
+   links, and "Hand to Claude Code" buttons. Finishing every step trips the gate
+   done + points you at the next move. Shared by Activation + the Pulse one-move. */
+
+const PLAYBOOK_PILL = { todo: 'lead', doing: 'in_progress', done: 'completed' }
+
+async function openPlaybook(key, opts = {}) {
+  let d
+  try { d = await api(`/api/playbook/${encodeURIComponent(key)}`) }
+  catch (e) { return }
+  if (!d || !d.steps) { // no playbook wired for this gate — fall back to the row, do nothing loud
+    return
+  }
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><aside class="drawer pb-drawer">
+    <div class="drawer__h">
+      <span class="pill ${PLAYBOOK_PILL[(d.gate || {}).status] || 'lead'}"><span class="dot"></span>${esc(((d.gate || {}).status || 'todo').replace('_', ' '))}</span>
+      <div class="pb-htitle">${esc((d.gate || {}).label || 'Playbook')}</div>
+      <button class="drawer__close">${I.x}</button>
+    </div>
+    <div class="drawer__b">
+      <div class="pb-prog">
+        <div class="pb-prog__top"><span class="pb-prog__lab">Playbook progress</span><b class="num pb-pct">${d.pct || 0}%</b></div>
+        <div class="goal__track"><div class="goal__fill ${(d.pct || 0) >= 100 ? 'over' : ''}" data-w="${d.pct || 0}%" style="width:0"></div></div>
+        <div class="pb-prog__sub"><span class="pb-donect">${(d.done || []).length}</span> of ${d.steps.length} moves done</div>
+      </div>
+      <div class="pb-steps">${d.steps.map((s, i) => playbookStep(s, i, (d.done || []).includes(i))).join('')}</div>
+      <div class="pb-complete" style="display:${(d.pct || 0) >= 100 ? 'flex' : 'none'}"></div>
+    </div>
+  </aside>`
+  document.body.appendChild(wrap)
+  const close = () => { wrap.remove(); if (opts.onClose) opts.onClose() }
+  $('.scrim', wrap).onclick = close
+  $('.drawer__close', wrap).onclick = close
+
+  const paint = (res) => {
+    const done = res.done || []
+    $('.pb-pct', wrap).textContent = (res.pct || 0) + '%'
+    $('.pb-donect', wrap).textContent = done.length
+    const fill = $('.pb-steps', wrap).closest('.drawer__b').querySelector('.goal__fill')
+    fill.style.width = (res.pct || 0) + '%'; fill.classList.toggle('over', (res.pct || 0) >= 100)
+    wrap.querySelectorAll('.pb-step').forEach((el) => {
+      const on = done.includes(Number(el.dataset.idx))
+      el.classList.toggle('on', on)
+      el.querySelector('.pb-check').classList.toggle('on', on)
+      el.querySelector('.pb-check').innerHTML = on ? I.check : ''
+    })
+    const cm = $('.pb-complete', wrap)
+    if (res.gate_complete) {
+      cm.style.display = 'flex'
+      cm.innerHTML = `<div class="pb-done-mark">${I.check}</div>
+        <div class="pb-done-copy"><div class="pb-done-t">Gate complete</div>
+          <div class="pb-done-s">${res.next_gate ? `Next move: <b>${esc(res.next_gate.label)}</b>` : 'Every gate is lit. The machine is fully on.'}</div></div>
+        ${res.next_gate ? `<button class="btn primary sm" id="pb-next">${I.arrow} Open next</button>` : ''}`
+      const nx = $('#pb-next', wrap)
+      if (nx) nx.onclick = () => { close(); openPlaybook(res.next_gate.key, opts) }
+    } else {
+      cm.style.display = 'none'; cm.innerHTML = ''
+    }
+  }
+
+  const bindSteps = () => {
+    wrap.querySelectorAll('.pb-check').forEach((b) => (b.onclick = async () => {
+      const el = b.closest('.pb-step'); const idx = Number(el.dataset.idx)
+      const turningOn = !el.classList.contains('on')
+      const res = await api(`/api/playbook/${encodeURIComponent(key)}/step`, { method: 'POST', body: JSON.stringify({ index: idx, done: turningOn }) })
+      paint(res)
+    }))
+    wrap.querySelectorAll('[data-pb-copy]').forEach((b) => (b.onclick = () => copyText(b.dataset.pbCopy, b)))
+    wrap.querySelectorAll('[data-pb-hand]').forEach((b) => (b.onclick = async () => {
+      const el = b.closest('.pb-step'); const idx = Number(el.dataset.idx)
+      const s = d.steps[idx] || {}
+      b.disabled = true; const old = b.innerHTML; b.innerHTML = `${I.spark} Dispatched`
+      await api('/api/handoffs', { method: 'POST', body: JSON.stringify({
+        kind: 'gate_step',
+        title: `${(d.gate || {}).label || key}: ${s.title || ('Step ' + (idx + 1))}`,
+        payload: { gate: key, step: idx, step_title: s.title || '', context: s.handoff || s.detail || '' },
+      }) })
+      b.classList.add('ai'); setTimeout(() => { b.innerHTML = old.replace('Hand to Claude', 'Re-send to Claude'); b.disabled = false }, 1500)
+    }))
+  }
+  bindSteps()
+  setTimeout(() => { const f = wrap.querySelector('.goal__fill[data-w]'); if (f) f.style.width = f.dataset.w }, 60)
+}
+
+function playbookStep(s, i, done) {
+  const snippet = (s.snippet || '').trim()
+  return `<div class="pb-step ${done ? 'on' : ''}" data-idx="${i}">
+    <button class="pb-check ${done ? 'on' : ''}">${done ? I.check : ''}</button>
+    <div class="pb-body">
+      <div class="pb-step__t">${esc(s.title || ('Step ' + (i + 1)))}</div>
+      ${s.detail ? `<div class="pb-step__d">${esc(s.detail)}</div>` : ''}
+      ${snippet ? `<div class="pb-snippet"><code>${esc(snippet)}</code></div>` : ''}
+      <div class="pb-acts">
+        ${snippet ? `<button class="btn ghost sm" data-pb-copy="${esc(snippet)}">${I.check} Copy</button>` : ''}
+        ${s.link ? `<a class="btn ghost sm" href="${esc(s.link)}" target="_blank" rel="noopener">${I.arrow} ${esc(s.link_label || 'Open')}</a>` : ''}
+        ${s.handoff ? `<button class="btn ai sm" data-pb-hand="${i}">${I.spark} Hand to Claude Code</button>` : ''}
+      </div>
+    </div>
+  </div>`
+}
+
+/* ===================== HANDOFFS (To Claude Code) ===================== */
+/* The cockpit dispatches real work to Claude Code and tracks it. Each handoff
+   carries a payload you can copy as a clean markdown brief and paste straight in. */
+const HANDOFF_STATUS = { new: 'lead', in_progress: 'in_progress', done: 'completed' }
+const HANDOFF_STATUS_LABEL = { new: 'New', in_progress: 'In progress', done: 'Done' }
+const HANDOFF_KIND_LABEL = { gate_step: 'Gate step', task: 'Task', build: 'Build', fix: 'Fix', research: 'Research' }
+
+function handoffReport(h) {
+  const p = h.payload || {}
+  const lines = [`# ${h.title || 'Handoff'}`, '']
+  lines.push(`**For:** Claude Code (Desk / Nyx)`)
+  if (h.kind) lines.push(`**Kind:** ${HANDOFF_KIND_LABEL[h.kind] || h.kind}`)
+  lines.push(`**Dispatched:** ${ago(h.created_at)} ago`)
+  lines.push('')
+  if (p.gate) lines.push(`**Gate:** ${p.gate}${p.step != null ? ` · step ${Number(p.step) + 1}` : ''}`)
+  if (p.step_title) lines.push(`**Step:** ${p.step_title}`)
+  if (p.context) { lines.push('', '## Context', p.context) }
+  if (p.note) { lines.push('', '## Note', p.note) }
+  lines.push('', '---', 'Sent from the Command Center. Do the work, then mark it done in the cockpit.')
+  return lines.join('\n')
+}
+function payloadPreview(h) {
+  const p = h.payload || {}
+  const bits = []
+  if (p.gate) bits.push(`gate: ${p.gate}${p.step != null ? ` #${Number(p.step) + 1}` : ''}`)
+  if (p.step_title) bits.push(p.step_title)
+  else if (p.context) bits.push(p.context)
+  else if (p.note) bits.push(p.note)
+  return bits.join(' · ')
+}
+
+async function viewHandoffs() {
+  const d = await api('/api/handoffs'); const items = d.handoffs || []; const s = d.summary || {}
+  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn ai sm" id="ho-add">${I.spark} New handoff</button>`; $('#ho-add').onclick = () => openHandoffNew() }
+  const live = items.filter((h) => h.status !== 'done')
+  const done = items.filter((h) => h.status === 'done')
+  const sec = (title, rows) => rows.length
+    ? `<div class="sec-h"><span class="label">${title}</span><span class="ct">${rows.length}</span></div><div class="list">${rows.map(handoffRow).join('')}</div>`
+    : ''
+  setView(`
+    <div class="brief"><span class="tag">${I.spark} The cockpit's line to Claude Code</span>
+      <p>When a move needs the heavy machine — a build, a fix, a deep research run — dispatch it here and it queues for Claude Code. Copy any one as a clean brief, paste it in, and tick it done when it lands. The gates fire these automatically when a step needs real work.</p></div>
+    <div class="kpis">
+      <div class="kpi primary"><div class="lab">New</div><div class="val">${s.new || 0}</div><div class="meta">waiting to send</div></div>
+      <div class="kpi ${s.in_progress ? 'warn' : ''}"><div class="lab">In progress</div><div class="val">${s.in_progress || 0}</div><div class="meta">Claude's on it</div></div>
+      <div class="kpi"><div class="lab">Done</div><div class="val">${s.done || 0}</div><div class="meta">shipped</div></div>
+      <div class="kpi"><div class="lab">Total</div><div class="val">${s.total || 0}</div><div class="meta">all-time</div></div>
+    </div>
+    ${items.length ? '' : emptyState('Nothing dispatched yet', 'Hit "New handoff" or fire one from a gate step. It becomes a clean brief you paste into Claude Code — the cockpit dispatching the heavy work and tracking it to done.')}
+    ${sec('In the queue', live)}
+    ${done.length ? sec('Shipped', done) : ''}
+  `)
+  bindHandoffs(items)
+}
+function handoffRow(h) {
+  const prev = payloadPreview(h)
+  const done = h.status === 'done'
+  return `<div class="lrow ho-row ${done ? 'done' : ''}">
+    <div class="grow">
+      <div class="nm">${esc(h.title || 'Handoff')}</div>
+      <div class="qmeta">
+        <span class="pill ${HANDOFF_STATUS[h.status] || 'lead'}"><span class="dot"></span>${esc(HANDOFF_STATUS_LABEL[h.status] || h.status)}</span>
+        ${h.kind ? `<span class="age-tag">${esc(HANDOFF_KIND_LABEL[h.kind] || h.kind)}</span>` : ''}
+        <span class="ct-when">${ago(h.created_at)} ago${done && h.done_at ? ` · shipped ${ago(h.done_at)} ago` : ''}</span>
+      </div>
+      ${prev ? `<div class="sub ho-prev">${esc(prev)}</div>` : ''}
+    </div>
+    <div class="qright">
+      <div class="qacts">
+        <button class="btn primary sm" data-ho-copy="${h.id}">${I.check} Copy report</button>
+        ${h.status === 'new' ? `<button class="btn ghost sm" data-ho-status="in_progress" data-ho-id="${h.id}">Mark sent</button>` : ''}
+        ${!done ? `<button class="btn ghost sm" data-ho-done="${h.id}">${I.check} Done</button>` : `<button class="btn ghost sm" data-ho-status="new" data-ho-id="${h.id}">Reopen</button>`}
+      </div>
+    </div>
+  </div>`
+}
+function bindHandoffs(items) {
+  app.querySelectorAll('[data-ho-copy]').forEach((b) => (b.onclick = () => { const h = items.find((x) => String(x.id) === b.dataset.hoCopy); if (h) copyText(handoffReport(h), b) }))
+  app.querySelectorAll('[data-ho-status]').forEach((b) => (b.onclick = async () => {
+    await api(`/api/handoffs/${b.dataset.hoId}/status`, { method: 'POST', body: JSON.stringify({ status: b.dataset.hoStatus }) }); renderApp('handoffs')
+  }))
+  app.querySelectorAll('[data-ho-done]').forEach((b) => (b.onclick = async () => {
+    await api(`/api/handoffs/${b.dataset.hoDone}/done`, { method: 'POST', body: JSON.stringify({}) }); renderApp('handoffs')
+  }))
+}
+function openHandoffNew() {
+  const KINDS = [['build', 'Build'], ['fix', 'Fix'], ['research', 'Research'], ['task', 'Task']]
+  const wrap = document.createElement('div')
+  wrap.innerHTML = `<div class="scrim"></div><div class="modal">
+    <div class="modal__h"><div class="t-h2">New handoff to Claude Code</div><button class="drawer__close mclose">${I.x}</button></div>
+    <div class="modal__b">
+      <div class="field"><label>What needs doing</label><input class="input" id="ho-title" placeholder="e.g. Build the Beat-Your-Quote landing page"></div>
+      <div class="field"><label>Kind</label>
+        <select class="input" id="ho-kind">${KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Context / the brief (optional)</label>
+        <textarea class="input ta" id="ho-note" rows="6" placeholder="Spell out what done looks like — the goal, files, copy angle, anything Claude needs cold."></textarea></div>
+    </div>
+    <div class="modal__f"><button class="btn ghost mclose">Cancel</button><button class="btn ai" id="ho-save">${I.spark} Dispatch</button></div>
+  </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.scrim', wrap).onclick = close
+  wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
+  $('#ho-save', wrap).onclick = async () => {
+    const title = $('#ho-title', wrap).value.trim(); if (!title) return
+    const note = $('#ho-note', wrap).value.trim()
+    await api('/api/handoffs', { method: 'POST', body: JSON.stringify({ kind: $('#ho-kind', wrap).value, title, payload: note ? { note } : undefined }) })
+    close(); renderApp('handoffs')
+  }
+}
 
 if (token) renderApp('pulse'); else renderLogin()

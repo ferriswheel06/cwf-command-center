@@ -1044,6 +1044,187 @@ app.get('/api/momentum', auth, async (c) => {
 })
 
 
+// ============================================================================
+// PLAYBOOKS — make the toggles REAL: guided step-by-step playbooks with actual
+// instructions, progress, and CONSEQUENCES (completing all steps flips the
+// activation gate done + unlocks the next move; steps can dispatch work to
+// Claude Code via the handoff queue). Tenant-scoped via biz(c).
+// Progress lives in settings key 'gate_progress' = { gate_key:[doneStepIndexes] }.
+// ============================================================================
+
+const PLAYBOOKS = {
+  gbp: [
+    { title: 'Open Google Business Profile', detail: 'Your profile is already verified (since 2026-03-24). Sign in with the carswithfares@gmail.com account and open the Cars With Fares profile to manage it. Everything below is edited right here in the dashboard.', link: 'https://business.google.com/' },
+    { title: 'Lock the business name', detail: 'Name must read exactly "Cars With Fares" — nothing else. Do NOT keyword-stuff it with "Mobile Mechanic Mississauga"; Google suspends profiles that do, and that suspension kills your Maps ranking.' },
+    { title: 'Set the primary category', detail: 'Category is the single biggest ranking factor, so get this right. Set the primary category to "Mobile mechanic" if it is available in the picker, otherwise "Auto repair shop".' },
+    { title: 'Add the supporting categories', detail: 'Add these as additional categories so you surface for more searches: Auto repair shop, Brake shop, Auto tune up service, Car repair and maintenance, Diagnostic center.' },
+    { title: 'Make it a service-area business', detail: 'You go to them, so hide the street address and set it up as a service-area business. Add these service areas: Mississauga, Toronto, Brampton, Etobicoke, Oakville, Milton, Vaughan, Burlington, Hamilton.' },
+    { title: 'List the big-job services', detail: 'Add every real job you want, each with a one-line description, so the profile reads like the high-ticket work you actually want: Suspension repair, Front-end / control arms, Brake repair, Engine repair, Clutch replacement, No-start diagnosis, Electrical, Cooling system, Pre-purchase inspection.' },
+    { title: 'Paste the business description', detail: 'Drop this exact description into the "From the business" field — it is trust-led, names you, and lists the real jobs.', snippet: 'Cars With Fares is a trusted mobile mechanic serving Mississauga and the GTA - we come to you. From suspension and front-end work to brakes, diagnostics, and engine repair, I handle the real jobs right in your driveway, office, or roadside. Honest diagnosis, a flat quote before I start, and quality OEM-grade parts. No shop runaround - just one mechanic who puts his name on the work. Same-day service across the GTA. Better Call Fares - 647-450-0406.' },
+    { title: 'Set hours, phone, and website', detail: 'Hours must match the site exactly (pick Mon-Sat 7am-9pm OR 24/7 and use the same one everywhere). Phone: 647-450-0406. Website: https://carswithfares.ca/mobile-mechanic. Under Attributes, turn on "Online appointments" and "Onsite services".', link: 'https://carswithfares.ca/mobile-mechanic' },
+    { title: 'Upload 5-6 real job photos (biggest quick win)', detail: 'Profiles with photos get about 2x the clicks — this matters more than almost anything else here. On your next job shoot a suspension/front-end repair mid-work, a clean finished install, you with the customer car, and your tool setup, then upload them. No stock photos.' },
+    { title: 'Seed the Q&A', detail: 'Post these 5 questions on your own profile and answer each from your account so customers see straight answers: do you come to my house, what jobs do you do, how do I get a quote, what areas do you cover, are you cheaper than a shop. Pull the exact answers from strategy/gbp-local-seo.md.' },
+    { title: 'Grab your review link', detail: 'In GBP click "Ask for reviews" and copy your review link — this is the one you text after every job. Your live link is below; the full review system lives in the Reviews gate.', snippet: 'https://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg' },
+    { title: 'Generate this week posts with Claude Code', detail: 'Posting 1-2 times a week keeps the profile active, which ranks better. Have Claude Code write a fresh batch in your voice (we come to you, big jobs done mobile, honest diagnosis, same-day at your door) so you are never staring at a blank box.', handoff: { kind: 'gbp_posts', title: 'Generate 10 fresh GBP posts in Fares voice (trust-led, we-come-to-you, big-job angles, each ending 647-450-0406) ready to paste 1-2 per week' } },
+    { title: 'Post the first one now', detail: 'Paste one post into GBP today so the profile shows recent activity, then set a reminder to post 1-2 per week from the batch Claude Code generates.', snippet: 'Suspension clunking? Front end feeling loose? You dont need to drop your car at a shop for a week. I come to your driveway, diagnose it straight, and fix it on the spot. Mississauga & the GTA. Call 647-450-0406' },
+  ],
+  reviews: [
+    { title: 'Confirm your one-tap review link', detail: 'This is the link that goes in every review text — it drops the customer straight onto the write-a-review screen. It is already live; save it so it is one tap for them.', snippet: 'https://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg' },
+    { title: 'Text Rob now (suspension, $1,400)', detail: 'Rob is your best shot — big happy job last week, perfect timing. Send this exact text. Asking him to name the suspension job and the at-home service plants SEO keywords that also power the BMW/Audi pages.', snippet: 'Hey Rob! How is the car riding after the suspension/front-end work? Should feel tight again.\n\nIf you have got 30 seconds, a Google review would genuinely help me out - even one line. If you can mention it was the suspension job and that I came right to your place, that helps other people find me:\nhttps://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg\n\nAppreciate you - Fares' },
+    { title: 'Text George now (Ram 2500 diesel, $450)', detail: 'George at Brothers Deals On Wheels in Oakville is your second easy review. Send this exact text — naming the diesel work and the Oakville visit adds another location keyword to your Maps presence.', snippet: 'Hey George! How is the Ram 2500 running since the diesel service?\n\nQuick favour - if you were happy with it, a Google review would mean a lot. A line about the diesel work and that I came out to you in Oakville goes a long way:\nhttps://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg\n\nThanks man - Fares' },
+    { title: 'Ask out loud at the end of every job', detail: 'The ask starts in person, before any text. As you pack up say "If you are happy with it, a Google review would really help me out." That one line nearly doubles how many actually leave one.' },
+    { title: 'Send the same-day text (2-4 hrs after)', detail: 'Catch them while the car still feels fixed and they are happy. Send this 2-4 hours after you finish, swapping in their name, vehicle, and service.', snippet: 'Hey [Name]! Just checking in - how is the [vehicle] feeling after the [service]? Everything running smooth?\n\nIf anything feels off, hit me up anytime.\n\nAlso, if you got 30 seconds, dropping a Google review would really help me out: https://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg\n\nThanks again - Fares' },
+    { title: 'Nudge once at 1 week if no review', detail: 'If a week passes with no review, send ONE gentle reminder — then stop. Never ask more than twice; being annoying costs you the referral too.', snippet: 'Hey [Name]! Hope the [vehicle] is treating you well after the [service] last week.\n\nQuick favor - if you were happy with the work, a Google review would mean a lot. Takes 30 seconds and helps other people find a solid mechanic: https://search.google.com/local/writereview?placeid=ChIJAa99cVdDK4gR3_54nauBoEg\n\nNo pressure though. Appreciate you either way!' },
+    { title: 'Plant the referral at 1-2 weeks', detail: 'Only for happy customers, 1-2 weeks out: turn the trust-job into the next lead with the shop-quote angle. High-ticket customers refer high-ticket customers.', snippet: 'Hey [Name]! Quick one - know anyone dreading a big repair bill, or sitting on a shop quote they are not sure about?\n\nSend them my way (647-450-0406 or carswithfares.ca) and I will take care of them the same way I did you - come to them, quote straight, no shop runaround.\n\nAppreciate you - Fares' },
+    { title: 'Coach what a good review says', detail: 'Reviews that name the service ("suspension repair"), the location ("came to my house in Mississauga"), and the experience ("showed up on time, fair flat price, showed me the old parts") rank you higher in local search. Nudge customers toward those details naturally — never script them.' },
+    { title: 'Track the flywheel and hit the targets', detail: 'For each closed job log four things: review asked (y/n), review left (y/n), referral asked (y/n), referral booked (who). Ask 100% of the time. Realistic conversion is 30-40% leaving a review and about 1 in 5 sending a referral. Goal: 15-20 reviews by month 3, 50+ by month 6.', handoff: { kind: 'review_tracker', title: 'Add a per-job review/referral tracker to the CRM (asked, review left, referral asked, referral booked) and surface the running counts against the 15-20 by month 3 target' } },
+  ],
+  google_ads: [
+    { title: 'Open or claim the Google Ads account', detail: 'Sign in at ads.google.com with the Cars With Fares Google account. An account was started back in March and was stuck "verifying" — finish identity/business verification if it asks, or create a fresh account if you cannot get back in.', link: 'https://ads.google.com' },
+    { title: 'Set up a Search-only campaign', detail: 'New campaign, objective "Leads", type "Search" only. Turn OFF Display network and Search Partners on the campaign settings page — they burn budget on no-intent clicks. Goal: people typing a real mobile-mechanic or bigger-repair need.' },
+    { title: 'Lock the geo, schedule and budget', detail: 'Location: Mississauga + 20km (Brampton, Etobicoke, Oakville, west Toronto, Milton), set to "people IN this location" not "interested in". Schedule Mon-Sat 7am-9pm. Budget $30-40/day. Start on Manual CPC ~$2-4 max until conversion tracking is live, then switch to Maximize Conversions. Lean mobile.' },
+    { title: 'Build the 3 ad groups + keywords', detail: 'AG1 mobile-mechanic intent, AG2 trusted/honest-mechanic intent, AG3 the specific bigger jobs (suspension, control arm, strut, timing chain, alternator, AC compressor, wheel bearing, CV axle). Phrase/exact match only. Add a new keyword every time a customer names the repair they needed.' },
+    { title: 'Paste in the negative-keyword wall', detail: 'This is what protects your margin and filters the wrong customer. Add every cheap/DIY/dealer/job-seeker term as a campaign negative. Note: quote, estimate and price match are negatives on purpose — those are price-shoppers, not repair-need searchers.', snippet: 'oil change, oil, cheap, cheapest, free, quote, estimate, price match, beat quote, diy, how to, do it yourself, jobs, hiring, salary, school, course, apprentice, tools, scanner, obd2, parts only, used parts, junkyard, scrap, tire, tires, detailing, car wash, rental, insurance, warranty, dealership, canadian tire, jiffy lube, walmart, wiper, battery boost, key fob, light bulb' },
+    { title: 'Load the responsive search ad', detail: 'One RSA per ad group. Trust + we-come-to-you voice, never "beat your quote". Final URL = the trust-led mobile-mechanic landing page (/mobile-mechanic). Path field: mobile-mechanic. Let Claude draft the full headline/description set in the next step.' },
+    { title: 'Have Claude Code draft the copy + keyword lists', detail: 'Hand the ad-group structure and the negative wall to Claude Code and get back the 12 headlines, 4 descriptions and a per-ad-group keyword list, all in the trusted-mobile-mechanic voice, ready to paste straight into the Ads editor.', handoff: { kind: 'google_ads_copy', title: 'Draft 12 RSA headlines + 4 descriptions (trust/we-come-to-you voice) and the 3 ad-group keyword lists from strategy/google-ads-campaign.md, plus the final negative-keyword wall' } },
+    { title: 'Go live, then watch the Search Terms report daily', detail: 'Launch at $30-40/day. Open the Search Terms report every day in week 1 and add anything cheap or irrelevant to the negative list — that daily pruning is 80% of running Ads well. Once generate_lead is importing as a conversion, flip bidding to Maximize Conversions.' },
+  ],
+  twilio: [
+    { title: 'Why this is safe to turn on', detail: 'The instant speed-to-lead auto-text is already built and live in the code as a no-op — nothing fires until these 3 secrets exist. Once they do, every new lead gets a personalized text within seconds. Responding in under a minute vs 30 can multiply your close rate.' },
+    { title: 'Create a Twilio account', detail: 'Sign up at twilio.com. Free trial is fine to test; add a small balance to go live. Texts cost about a penny each.', link: 'https://www.twilio.com/try-twilio' },
+    { title: 'Buy a Canadian number with SMS', detail: 'In the Twilio console, Phone Numbers > Buy a number. Pick a local Canadian number with SMS capability (~$1-2/mo). This becomes the FROM number the auto-text sends from.', link: 'https://console.twilio.com/us1/develop/phone-numbers/manage/search' },
+    { title: 'Grab the 3 secrets', detail: 'From the Twilio console dashboard copy: Account SID (starts AC...), Auth Token (click to reveal), and your new Twilio number in E.164 format like +16475551234. Keep them somewhere safe for the next step — do not paste them into any doc.', link: 'https://console.twilio.com' },
+    { title: 'Preview the message it will send', detail: 'This fixed template fires automatically to every new lead the second they come in — reliable and instant. Replies route to your Twilio number; the text tells them to call/text your real line for the conversation.', snippet: 'Hey {name}, it is Fares from Cars With Fares — got your note about {issue}. I come to you and can take a look. What does your day look like? Reply here or call/text 647-450-0406.' },
+    { title: 'Hand the 3 secrets to Claude Code to wire in', detail: 'Give Claude Code the Account SID, Auth Token and FROM number. Claude sets them as the worker secrets TWILIO_SID, TWILIO_TOKEN and TWILIO_FROM with no trailing newline, confirms the no-op flips live, and fires one test text so you see it land before real leads do.', handoff: { kind: 'twilio_secrets', title: 'Set TWILIO_SID, TWILIO_TOKEN and TWILIO_FROM as worker secrets (no trailing newline), confirm crm-api/src/sms.js goes live, and send one test text to 647-450-0406 to verify' } },
+  ],
+  ga4: [
+    { title: 'Why this one matters most for Ads', detail: 'The site already fires a generate_lead event on every form submit — but until you mark it a Key Event, Google Ads is blind and burns budget on clicks that never convert. This is a 2-minute toggle and it is the gate that makes the Ads campaign actually optimize.' },
+    { title: 'Open GA4 Admin > Events', detail: 'Go to analytics.google.com, pick the Cars With Fares property, click Admin (bottom-left gear), then under the Data display column click "Events". You should see generate_lead in the list (submit a quote form once if it has not shown up yet).', link: 'https://analytics.google.com' },
+    { title: 'Toggle generate_lead to a Key Event', detail: 'In the Events table, find the generate_lead row and flip the "Mark as key event" toggle on the right to ON. That is it — GA4 now counts every form submit as a conversion.' },
+    { title: 'Import it into Google Ads as a conversion', detail: 'In Google Ads go to Goals > Conversions > Summary > New conversion action > Import > Google Analytics 4 (GA4). Tick generate_lead and import it. Also add a tap-to-call conversion so phone clicks count too. Now Maximize Conversions has something real to optimize toward.', link: 'https://ads.google.com' },
+  ],
+  content: [
+    { title: 'Lock the angle: trust, not price', detail: 'Every post sells trust + expertise + convenience, never "cheapest" or "beat your quote." The goal: a non-car-person watches and thinks "this is the guy I would actually trust with my car." No fake numbers (no "500+ cars"), no oil-change content, no shop-war drama.' },
+    { title: 'Fix your bios to the honest versions', detail: 'Update Instagram and TikTok bios to the locked copy below. Link both to carswithfares.ca/mobile-mechanic. Personality + face is the brand — people book a person they trust, not a logo.', snippet: 'INSTAGRAM:\nFares - Mobile Mechanic - Mississauga & GTA\nThe big jobs, done right - at your door.\nHonest diagnosis. Quoted before I start.\nBook -> carswithfares.ca/mobile-mechanic\n\nTIKTOK:\nMobile mechanic | GTA\nSuspension - front-end - diagnostics - at your driveway\nThe mechanic you can actually trust\nBook -> carswithfares.ca/mobile-mechanic' },
+    { title: 'Post 4x a week, rotate the 4 pillars', detail: 'Mon = Detective (a diagnostic win), Wed = Real Job (a bigger repair, before/after), Fri = Honest Car-Guy (face/personality), Sun = Teach (a generous expert tip). Keep ~60% solo so you never stall waiting on a job, and film every real big job you do — those convert hardest.' },
+    { title: 'End every caption with the same soft CTA', detail: 'No hard sell. Close every video and caption the same way so the funnel is consistent. Drives to carswithfares.ca/mobile-mechanic.', snippet: 'Mississauga & the GTA - I come to you. Book at the link in bio.' },
+    { title: 'Capture every big job on camera', detail: 'The Real Job + Detective clips are your highest-trust content. Shoot suspension, front-end refreshes, control arms, clutch, no-start revivals on the DJI Action 5 Pro. A 3-shop-stumped diagnostic win is the single best-performing format — always roll for it.' },
+    { title: 'Pin your 3 best videos', detail: 'Pin your strongest Detective win, a big Real-Job before/after, and a "why I went mobile / who I am" trust video to the top of both profiles. New visitors judge you off those three.' },
+    { title: 'Reply to every comment for 30 days', detail: 'For the first 30 days reply to every single comment — each reply re-surfaces the video to the algorithm and starts the relationship. Treat comments as inbound leads, not noise.' },
+    { title: 'Have Claude Code write this week’s 4 posts', detail: 'Hand it off — Claude Code pulls from the 28 re-angled scripts and the concept bank in strategy/content-plan-v2.md and writes one post per pillar (hook + caption + the soft CTA), matched to your cadence and any real jobs you filmed this week.', handoff: { kind: 'content_week_posts', title: 'Generate this week’s 4 posts (one per pillar) from the 28 scripts + concept bank, each ending with the GTA / link-in-bio CTA, trust-led, no price-shaming' } },
+  ],
+  retell: [
+    { title: 'Create your Retell AI account', detail: 'Retell runs the voice agent that answers when you are under a car. Sign up, verify your email, and grab the free trial credits so you can test before paying. This is the brain that catches every missed call instantly.', link: 'https://www.retellai.com' },
+    { title: 'Create an ElevenLabs account for the voice', detail: 'ElevenLabs gives the agent a natural voice. Sign up, then pick a warm, casual male voice (not a corporate robot) so it sounds like a friend who happens to be a mechanic. Copy the voice ID — Retell needs it to connect.', link: 'https://elevenlabs.io' },
+    { title: 'Buy or connect a phone number', detail: 'In Retell, provision a phone number (or port your business line) so calls route into the agent. Set it to answer only when you do not pick up — the agent catches the overflow, you stay on the tools.', link: 'https://dashboard.retellai.com' },
+    { title: 'Load the agent prompt', detail: 'Paste the full agent prompt from ai-phone-agent/AGENT-PROMPT.md into Retell as the system prompt. It already has the identity, trust voice, services (lead with the big jobs), coverage, conversation flow, objections, and hard rules. Do not water it down.' },
+    { title: 'Set the opening line + honesty rule', detail: 'Confirm the greeting and the "I am Fares’s AI assistant" honesty rule are intact. Never let it claim to be a different human or invent a name — honesty is the whole brand.', snippet: 'Hey, thanks for calling Cars With Fares - what’s going on with your car?\n(After 10pm: Hey, you’ve reached Cars With Fares - what’s going on?)' },
+    { title: 'Wire the escalation patch to your cell', detail: 'Set the transfer number to 647-450-0406 and the rule: patch high-ticket consumer jobs straight to you — big repairs (suspension/front-end/engine/clutch/no-start), nicer cars (BMW/Mercedes/Audi), anything urgent, or when they ask for Fares by name. If you do not pick up, the agent reassures and captures everything.' },
+    { title: 'Lock the pricing + diagnosis guardrails', detail: 'Never a hard price on the phone — "depends on the vehicle and what we find, but Fares quotes the flat price before he starts, no surprises." Never a definitive diagnosis — "Fares confirms it on-site." Never pitch price or "beat your quote." No tax/HST talk.' },
+    { title: 'Turn on the after-call SMS follow-up', detail: 'Configure the post-call text so every caller gets a warm follow-up with your number and the AI advisor link. Keeps the lead warm until you call back.', snippet: 'Hey [name], it’s Cars With Fares - got your info, Fares will be in touch shortly. You can also describe your problem to our AI assistant here: carswithfares.ca/mobile-mechanic - or call/text 647-450-0406 anytime.' },
+    { title: 'Test it with a real call', detail: 'Call the number yourself and run a real scenario (e.g. a clunk over bumps on a BMW). Check it captures name + number + symptom, gives an honest non-committal read, and offers to patch you in. Fix anything that sounds scripted or off-brand before it goes live.' },
+    { title: 'Have Claude Code wire it end-to-end', detail: 'Once your accounts exist, hand off the keys and number — Claude Code loads the prompt, configures the ElevenLabs voice, sets the 647-450-0406 escalation logic, the SMS follow-up, and the missed-call routing, then runs a test-call checklist so you only have to confirm it.', handoff: { kind: 'retell_wire_agent', title: 'Wire the Retell phone agent: load AGENT-PROMPT.md, connect the ElevenLabs voice, set escalation to 647-450-0406, the after-call SMS, missed-call routing, and a test-call checklist' } },
+  ],
+}
+
+// progress map helper — { gate_key:[doneStepIndexes] }, tenant-scoped via settings
+async function gateProgress(b) { return await getJson(b, 'gate_progress', {}) }
+function gatePct(key, done) {
+  const total = (PLAYBOOKS[key] || []).length
+  if (!total) return 0
+  return Math.round((done.length / total) * 100)
+}
+
+// GET the playbook for a gate — steps + the gate row + which steps are done + pct
+app.get('/api/playbook/:key', auth, async (c) => {
+  const key = c.req.param('key'), b = biz(c)
+  const steps = PLAYBOOKS[key]
+  if (!steps) return c.json({ error: 'no playbook for that gate' }, 404)
+  const gate = (await q(`select key, label, status from activation where business_id=$1 and key=$2`, [b, key])).rows[0]
+    || { key, label: key, status: 'todo' }
+  const prog = await gateProgress(b)
+  const done = Array.isArray(prog[key]) ? prog[key].filter((i) => i >= 0 && i < steps.length) : []
+  return c.json({ gate, steps, done, pct: gatePct(key, done) })
+})
+
+// Toggle a single step done/undone — completing ALL steps flips the gate done + logs it, returns the next gate to work
+app.post('/api/playbook/:key/step', auth, async (c) => {
+  const key = c.req.param('key'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const steps = PLAYBOOKS[key]
+  if (!steps) return c.json({ error: 'no playbook for that gate' }, 404)
+  const index = Number(d.index)
+  if (!Number.isInteger(index) || index < 0 || index >= steps.length) return c.json({ error: 'bad step index' }, 400)
+  const prog = await gateProgress(b)
+  const set = new Set((Array.isArray(prog[key]) ? prog[key] : []).filter((i) => i >= 0 && i < steps.length))
+  if (d.done === false) set.delete(index)
+  else set.add(index)
+  const done = [...set].sort((a, z) => a - z)
+  prog[key] = done
+  await setJson(b, 'gate_progress', prog)
+
+  const gateComplete = done.length === steps.length
+  let next_gate = null
+  if (gateComplete) {
+    const cur = (await q(`select status from activation where business_id=$1 and key=$2`, [b, key])).rows[0]
+    await q(`update activation set status='done', updated_at=now() where business_id=$1 and key=$2`, [b, key])
+    if (!cur || cur.status !== 'done') {
+      const label = (await q(`select label from activation where business_id=$1 and key=$2`, [b, key])).rows[0]?.label || key
+      await q(`insert into activity (business_id,type,body) values ($1,'activation',$2)`, [b, `Gate completed — ${label} ✓`])
+    }
+    next_gate = (await q(`select key, label from activation where business_id=$1 and status='todo' and key<>$2 order by sort asc limit 1`, [b, key])).rows[0] || null
+  } else {
+    // if a finished gate gets a step unchecked, walk it back to doing so the board stays honest
+    if (d.done === false) await q(`update activation set status=case when status='done' then 'doing' else status end, updated_at=now() where business_id=$1 and key=$2`, [b, key])
+  }
+  return c.json({ done, pct: gatePct(key, done), gate_complete: gateComplete, next_gate })
+})
+
+// ---- HANDOFF QUEUE — the Claude Code bridge. A step (or the cockpit) dispatches
+// real work to Claude Code; Claude Code picks it up, does it, marks it done. ----
+const HANDOFF_STATUSES = ['new', 'in_progress', 'done']
+app.get('/api/handoffs', auth, async (c) => {
+  const b = biz(c)
+  const rows = (await q(`select id, kind, title, payload, status, result, created_at, done_at
+      from handoffs where business_id=$1 order by created_at desc`, [b])).rows
+  const summary = {
+    total: rows.length,
+    new: rows.filter((r) => r.status === 'new').length,
+    in_progress: rows.filter((r) => r.status === 'in_progress').length,
+    done: rows.filter((r) => r.status === 'done').length,
+  }
+  return c.json({ handoffs: rows, summary })
+})
+app.post('/api/handoffs', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  const kind = (d.kind || '').toString().trim()
+  const title = (d.title || '').toString().trim()
+  if (!kind || !title) return c.json({ error: 'need a kind and title' }, 400)
+  const payload = d.payload && typeof d.payload === 'object' ? d.payload : {}
+  const row = (await q(`insert into handoffs (business_id,kind,title,payload,status)
+      values ($1,$2,$3,$4::jsonb,'new')
+      returning id, kind, title, payload, status, result, created_at, done_at`,
+    [b, kind, title, JSON.stringify(payload)])).rows[0]
+  await q(`insert into activity (business_id,type,body) values ($1,'handoff',$2)`, [b, `Dispatched to Claude Code: ${title}`])
+  return c.json({ handoff: row })
+})
+app.post('/api/handoffs/:id/done', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const row = (await q(`select id, title from handoffs where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!row) return c.json({ error: 'not found' }, 404)
+  const result = d.result != null ? (d.result || '').toString() : null
+  await q(`update handoffs set status='done', result=$1, done_at=now() where id=$2 and business_id=$3`, [result, id, b])
+  await q(`insert into activity (business_id,type,body) values ($1,'handoff',$2)`, [b, `Claude Code finished: ${row.title}`])
+  return c.json({ ok: true, status: 'done' })
+})
+app.post('/api/handoffs/:id/status', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const status = (d.status || '').toString()
+  if (!HANDOFF_STATUSES.includes(status)) return c.json({ error: 'bad status' }, 400)
+  const stampDone = status === 'done'
+  const r = await q(`update handoffs set status=$1${stampDone ? ', done_at=coalesce(done_at,now())' : ''} where id=$2 and business_id=$3`, [status, id, b])
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  return c.json({ ok: true, status })
+})
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
