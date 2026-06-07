@@ -774,3 +774,41 @@ textarea.input.ta{height:auto}
   .side__wm{display:none}
   .side__logo{justify-content:center;padding:var(--s2) 0 var(--s4)}
 }
+
+/* ===================== QA · MAKE IT PROPER ===================== */
+/* Root cause of the broken HIGH-TICKET badge: inline icons had no size cap, so they
+   ballooned and shoved text into a wrap. Cap every icon used in a compact context. */
+.ai-score svg,.pill svg,.safety svg,.brief .tag svg,.bd-chip svg,.status-pill svg,
+.age-tag svg,.profit-tag svg,.vt svg,.mini-h svg{width:12px;height:12px;flex-shrink:0}
+.om-tag svg{width:13px;height:13px;flex-shrink:0}
+.btn svg{width:15px;height:15px;flex-shrink:0}
+.btn.sm svg{width:13px;height:13px}
+.drawer__close svg{width:16px;height:16px}
+.act__check svg{width:13px;height:13px}
+.empty .ic svg{width:100%;height:100%}
+
+/* badges/pills hold ONE line and never get squeezed into a wrap */
+.ai-score,.pill,.safety,.status-pill,.age-tag,.profit-tag,.om-tag,.brief .tag,.bd-chip{
+  white-space:nowrap;flex-shrink:0;line-height:1}
+
+/* let text columns shrink so badges/amounts sit right instead of being shoved/overflowing */
+.jc__top>div:first-child,.lrow .grow,.act .grow,.attn-row .grow,.qrow .grow,.gb__top,.co-line{min-width:0}
+
+/* job cards: breathe + long names wrap gracefully (cap 2 lines — no 4-line towers) */
+.jc{padding:var(--s4);gap:var(--s2)}
+.jc__top{align-items:flex-start;gap:var(--s2)}
+.jc__top>div:first-child{flex:1;min-width:0}
+.jc .nm{min-width:0;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
+.jc .veh,.jc .iss{overflow-wrap:anywhere}
+.jc .iss{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.col__b{gap:var(--s3)}
+
+/* list rows: detail truncates instead of breaking the row layout */
+.lrow{gap:var(--s3)}
+.lrow .grow{min-width:0}
+.lrow .nm{overflow-wrap:anywhere}
+.lrow .sub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* KPI values never collide with their label */
+.kpi .val{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
