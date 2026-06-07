@@ -1,46 +1,79 @@
-/* Cars With Fares — Command Center · design tokens (the system) */
+/* Cars With Fares — Command Center · design tokens (the system) — REDESIGN v2 */
 :root{
-  /* surfaces — 5-step elevation ramp */
-  --bg:#050506; --bg2:#0d0e11; --bg3:#131519; --bg4:#1a1d22; --bg5:#22262d;
-  /* text — 4 deliberate tiers (AA on --bg2) */
-  --fg:#F4F5F7; --fg2:#C5C9D3; --fg3:#868B98; --fg4:#565B6B;
+  /* surfaces — warm-graphite, 6-step elevation lifted OFF the void
+     (was #050506 near-black → this is the #1 "too dark / flat" fix) */
+  --void:#08090C;          /* deepest gutter — behind the rail only */
+  --bg:#0F1115;            /* app canvas — warm ink, ~L8%. alive, not a black hole */
+  --bg2:#171A20;           /* panels / cards — clear lift off canvas */
+  --bg3:#1E222A;           /* nested (kanban cards, drawer, rows) */
+  --bg4:#262B34;           /* inputs / wells / chips (recessed) */
+  --bg5:#30353F;           /* top elevation / toggles-off / hover ceiling */
+  /* text — crisp anchor + AA-readable mids on --bg2 */
+  --fg:#F7F8FA;            /* primary — near-pure, slightly warm white. the crisp anchor */
+  --fg2:#C2C7D0;           /* body / secondary — ~9:1, comfortable */
+  --fg3:#8B919E;           /* labels / meta — ~5:1, passes AA */
+  --fg4:#646B78;           /* faint / placeholder — quiet by choice, no longer mush */
   /* brand */
-  --navy:#6EAAFF; --navy-d:rgba(110,170,255,.12);
-  --accent:#E0922E; --accent-h:#F0A340; --accent-d:rgba(224,146,46,.14); --accent-bd:rgba(224,146,46,.35);
-  /* status */
-  --green:#44D07F; --green-d:rgba(68,208,127,.12);
-  --yellow:#F5C84B; --yellow-d:rgba(245,200,75,.12);
-  --red:#F6736B; --red-d:rgba(246,115,107,.12);
-  --purple:#A78BFA; --purple-d:rgba(167,139,250,.12);
+  --navy:#5BA1F5; --navy-d:rgba(91,161,245,.14);
+  --accent:#F2A03D; --accent-h:#FFB454; --accent-d:rgba(242,160,61,.16); --accent-bd:rgba(242,160,61,.42); --accent-ink:#1A1206;
+  /* status — hues kept, tints bumped to read on the lighter canvas */
+  --green:#3FCB84; --green-d:rgba(63,203,132,.14);
+  --yellow:#F5C24B; --yellow-d:rgba(245,194,75,.14);
+  --red:#F26B62; --red-d:rgba(242,107,98,.14);
+  --purple:#A78BFA; --purple-d:rgba(167,139,250,.14);
   /* AI — reserved violet ("the machine did this") */
-  --ai:#8B7CF6; --ai-2:#B3A6FF; --ai-d:rgba(139,124,246,.13); --ai-grad:linear-gradient(135deg,#8B7CF6,#5BB0FF);
-  /* lines & depth */
-  --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.04); --line3:rgba(255,255,255,.11);
-  --ring:0 0 0 3px rgba(224,146,46,.30);
-  --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.45);
-  --shadow-lg:0 8px 40px rgba(0,0,0,.7);
-  --shadow-pop:0 4px 24px rgba(0,0,0,.55);
-  --shadow-card:0 1px 0 rgba(255,255,255,.03) inset,0 2px 4px rgba(0,0,0,.3),0 12px 28px -12px rgba(0,0,0,.55);
-  --glow-accent:0 0 0 1px var(--accent-bd),0 14px 50px -16px rgba(224,146,46,.4);
-  /* type */
-  --font:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --ai:#8B7CF6; --ai-2:#B9ADFF; --ai-d:rgba(139,124,246,.16); --ai-grad:linear-gradient(135deg,#8B7CF6,#5BA1F5);
+  /* the mark's structural steel — cool counterweight to amber */
+  --steel:#5A6172;
+  /* lines & depth — higher canvas means white-alpha hairlines finally register */
+  --line:rgba(255,255,255,.08); --line2:rgba(255,255,255,.05); --line3:rgba(255,255,255,.14);
+  /* directional bevel: lit top lip + shaded bottom (one light source, from the top) */
+  --hair-top:rgba(255,255,255,.07); --hair-bot:rgba(0,0,0,.45);
+  --ring:0 0 0 1px var(--accent),0 0 0 4px rgba(242,160,61,.20);
+  /* shadows — split contact + ambient, on a surface that can finally receive them */
+  --shadow:0 1px 2px rgba(0,0,0,.45),0 4px 14px -4px rgba(0,0,0,.45);
+  --shadow-lg:0 12px 32px rgba(0,0,0,.5),0 40px 80px -32px rgba(0,0,0,.75);
+  --shadow-pop:0 2px 8px rgba(0,0,0,.45),0 18px 48px -16px rgba(0,0,0,.65);
+  /* the crafted-surface recipe: lit top edge + shaded bottom + grounded shadow */
+  --shadow-card:inset 0 1px 0 0 var(--hair-top),inset 0 -1px 0 0 var(--hair-bot),0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.6);
+  --glow-accent:inset 0 1px 0 0 rgba(255,255,255,.12),0 0 0 1px var(--accent-bd),0 18px 60px -18px rgba(242,160,61,.5);
+  /* type — Inter UI, JetBrains numerals; chassis + scale fixed */
+  --font:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   --mono:'JetBrains Mono',ui-monospace,'SF Mono',monospace;
   /* spacing — strict 8pt (+4pt half) */
   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px; --s8:64px;
-  /* radii */
-  --r:8px; --r2:6px; --r3:12px; --rp:999px;
+  /* radii — nested ramp (outer larger, inner smaller, concentric) */
+  --r:10px; --r2:7px; --r3:14px; --rp:999px;
   /* motion */
   --ease:cubic-bezier(.2,.7,.2,1); --ease-spring:cubic-bezier(.22,.68,0,1.2);
   --tf:120ms; --tt:180ms; --ts:260ms;
   /* shell */
-  --sidebar:220px;
+  --sidebar:236px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{font-size:14px}
-body{background:radial-gradient(1100px 700px at 78% -12%,#0c0e15 0%,var(--bg) 55%);background-attachment:fixed;color:var(--fg2);font-family:var(--font);-webkit-font-smoothing:antialiased;line-height:1.5;min-height:100dvh}
-button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+html{font-size:15px;-webkit-text-size-adjust:100%}
+body{
+  background:
+    radial-gradient(1200px 760px at 82% -16%, #1C1A16 0%, transparent 58%),
+    radial-gradient(1100px 700px at 6% 108%, #12161F 0%, transparent 60%),
+    var(--bg);
+  background-attachment:fixed;
+  color:var(--fg2);
+  font-family:var(--font);
+  font-feature-settings:'cv11','ss01';            /* single-story a + calibrated grotesk = less "stock Inter" */
+  letter-spacing:-.011em;                         /* global hairline tighten — the "tuned" baseline */
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  text-rendering:optimizeLegibility;
+  line-height:1.5;min-height:100dvh;
+}
+/* near-invisible matte grain — kills dark-UI banding, adds the "expensive" texture */
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:1;opacity:.022;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit;letter-spacing:inherit}
 button{cursor:pointer;border:none;background:none}
-.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 svg{display:block}
-::selection{background:var(--accent-d)}
+::selection{background:rgba(242,160,61,.28);color:var(--fg)}
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}

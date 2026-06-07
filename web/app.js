@@ -38,6 +38,7 @@ const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
   app.innerHTML = `<div class="login"><div class="login-card">
+    <div class="login-brand"><svg class="cwf-mark" viewBox="0 0 24 24" width="46" height="46" fill="none" role="img" aria-label="Cars With Fares" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" stroke="var(--steel)" stroke-width="1.6"/><path d="M12 3a9 9 0 0 1 7.79 4.5" stroke="var(--accent)" stroke-width="1.9" stroke-linecap="round"/><path d="M9.4 14.6 12 8.2l2.6 6.4" stroke="var(--accent)" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round"/><circle cx="12" cy="15.4" r="1.15" fill="var(--fg)"/></svg></div>
     <div class="mark">Cars With Fares</div><div class="sub">Command Center</div>
     <input id="pw" type="password" placeholder="Password" autocomplete="current-password" />
     <button id="go">Enter</button><div class="err">${esc(msg)}</div>
@@ -59,7 +60,10 @@ async function renderApp(next) {
   app.innerHTML = `
     <div class="shell">
       <aside class="side">
-        <div class="side__logo"><span class="chip">CWF</span><span>Command</span></div>
+        <div class="side__logo">
+          <svg class="cwf-mark" viewBox="0 0 24 24" width="28" height="28" fill="none" role="img" aria-label="Cars With Fares" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" stroke="var(--steel)" stroke-width="1.6"/><path d="M12 3a9 9 0 0 1 7.79 4.5" stroke="var(--accent)" stroke-width="1.9" stroke-linecap="round"/><path d="M9.4 14.6 12 8.2l2.6 6.4" stroke="var(--accent)" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round"/><circle cx="12" cy="15.4" r="1.15" fill="var(--fg)"/></svg>
+          <span class="side__wm"><b>Cars With Fares</b><i>Command Center</i></span>
+        </div>
         ${NAV_GROUPS.map(([grp, items]) => `<div class="nav-group">${grp}</div>` + items.map(([k, l, ic]) => `<button class="nav-item ${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')).join('')}
         <div class="side__foot"><div class="side__biz"><span class="dot"></span>Cars With Fares</div></div>
       </aside>
