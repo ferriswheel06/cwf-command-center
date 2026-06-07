@@ -249,7 +249,8 @@ app.get('/api/pulse', auth, async (c) => {
       count(*) filter (where status in ('completed','paid'))::int as done_jobs,
       count(*) filter (where status in ('completed','paid') and review_ask_sent_at is not null)::int as asked,
       coalesce(sum(charge) filter (where status='paid' and paid_at > now()-interval '7 days'),0)::float as rev_wk,
-      count(*) filter (where status='scheduled')::int as booked
+      count(*) filter (where status='scheduled')::int as booked,
+      count(*) filter (where status='completed')::int as unpaid
     from jobs where business_id=$1`, [b])).rows[0]
   const mr = (await q(`select percentile_cont(0.5) within group (order by extract(epoch from (first_contact_at-created_at))/60.0) as v
       from jobs where business_id=$1 and first_contact_at is not null and status<>'lead'`, [b])).rows[0].v
@@ -276,6 +277,7 @@ app.get('/api/pulse', auth, async (c) => {
   const delta = prev ? score - prev.score : null
   await q(`insert into momentum (business_id,day,score,breakdown) values ($1,current_date,$2,$3::jsonb)
            on conflict (business_id,day) do update set score=$2, breakdown=$3::jsonb`, [b, score, JSON.stringify({ acquisition, conversion, trust, cash })])
+  const trend = (await q(`select day, score from momentum where business_id=$1 and day > current_date - 14 order by day`, [b])).rows
 
   let oneMove
   if (!signals.gbp_claimed) oneMove = { key: 'gbp', title: 'Claim + optimize your Google Business Profile', why: 'The loudest speaker you’re not using — local, ready-to-buy intent. The single biggest move on the board.', cta: 'Mark GBP claimed' }
@@ -292,7 +294,7 @@ app.get('/api/pulse', auth, async (c) => {
       hear: { new_leads: m.leads_wk, status: m.leads_wk > 0 ? 'good' : 'bad' },
       respond: { open_leads: m.open_leads, median_reply: mr == null ? null : Math.round(mr), status: replyS >= 80 ? 'good' : replyS >= 50 ? 'warn' : 'bad' },
     },
-    oneMove, goals, signals, rev_wk: m.rev_wk, needs: { stale: m.stale, hot: hot || null },
+    oneMove, goals, signals, rev_wk: m.rev_wk, trend, needs: { stale: m.stale, unpaid: m.unpaid, hot: hot || null },
   })
 })
 app.post('/api/pulse/action', auth, async (c) => {

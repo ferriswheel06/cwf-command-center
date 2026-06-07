@@ -87,11 +87,16 @@ function emptyState(ttl, sub) { return `<div class="empty"><div class="ic">${I.b
 function gauge(score) {
   const r = 54, circ = 2 * Math.PI * r, off = circ * (1 - Math.max(0, Math.min(100, score)) / 100)
   const col = score >= 66 ? '#44D07F' : score >= 33 ? '#E0922E' : '#F6736B'
-  return `<svg viewBox="0 0 128 128" width="128" height="128" style="flex-shrink:0">
-    <circle cx="64" cy="64" r="${r}" fill="none" stroke="#1a1d22" stroke-width="10"/>
-    <circle cx="64" cy="64" r="${r}" fill="none" stroke="${col}" stroke-width="10" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 64 64)"/>
-    <text x="64" y="62" text-anchor="middle" fill="#F4F5F7" font-size="32" font-weight="700" font-family="'JetBrains Mono',monospace">${score}</text>
-    <text x="64" y="82" text-anchor="middle" fill="#868B98" font-size="9" letter-spacing="1.5">ENERGY</text></svg>`
+  return `<svg viewBox="0 0 132 132" width="132" height="132" style="flex-shrink:0">
+    <circle cx="66" cy="66" r="${r}" fill="none" stroke="#1a1d22" stroke-width="9"/>
+    <circle id="gring" class="gauge-ring" cx="66" cy="66" r="${r}" fill="none" stroke="${col}" stroke-width="9" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${circ.toFixed(1)}" data-target="${off.toFixed(1)}" transform="rotate(-90 66 66)"/>
+    <text id="gscore" x="66" y="64" text-anchor="middle" fill="#F4F5F7" font-size="34" font-weight="700" font-family="'JetBrains Mono',monospace">0</text>
+    <text x="66" y="84" text-anchor="middle" fill="#868B98" font-size="9" letter-spacing="1.5">ENERGY</text></svg>`
+}
+function countUp(el, to, dur = 950) {
+  if (!el) return; const start = performance.now()
+  const step = (t) => { const p = Math.min(1, (t - start) / dur); el.textContent = Math.round(p * to); if (p < 1) requestAnimationFrame(step) }
+  requestAnimationFrame(step)
 }
 function bdChip(name, val) { return `<span class="bd-chip"><span>${name}</span><b>${Math.round(val || 0)}</b></span>` }
 function voiceCard(title, value, status, sub, question) {
@@ -101,18 +106,33 @@ function voiceCard(title, value, status, sub, question) {
 function goalBar(name, val, target, isMoney) {
   const pct = Math.min(100, Math.round((val / (target || 1)) * 100)); const f = (n) => isMoney ? money(n) : n
   return `<div class="gb"><div class="gb__top"><span>${name}</span><b class="num">${f(val)} / ${f(target)}</b></div>
-    <div class="goal__track"><div class="goal__fill ${pct >= 100 ? 'over' : ''}" style="width:${pct}%"></div></div></div>`
+    <div class="goal__track"><div class="goal__fill ${pct >= 100 ? 'over' : ''}" data-w="${pct}%" style="width:0"></div></div></div>`
+}
+function sparkline(trend) {
+  if (!trend || !trend.length) return `<div class="spark-empty">No history yet — your daily reads will plot here as the loop runs.</div>`
+  const max = Math.max(...trend.map((t) => t.score || 0), 1)
+  return `<div class="spark">${trend.map((t, i) => `<i class="${i === trend.length - 1 ? 'now' : ''}" style="height:${Math.max(5, Math.round(((t.score || 0) / max) * 44))}px"></i>`).join('')}</div>`
+}
+function needsPanel(n) {
+  const rows = []
+  if (n && n.hot) rows.push(`<div class="lrow" data-job="${n.hot.id}"><div class="grow"><div class="nm">Call ${esc(n.hot.customer)} now</div><div class="sub">hot lead, no reply yet</div></div><span class="pill in_progress"><span class="dot"></span>now</span></div>`)
+  if (n && n.stale) rows.push(`<div class="lrow"><div class="grow"><div class="nm">${n.stale} lead${n.stale > 1 ? 's' : ''} going stale</div><div class="sub">no movement in 3+ days</div></div></div>`)
+  if (n && n.unpaid) rows.push(`<div class="lrow"><div class="grow"><div class="nm">${n.unpaid} job${n.unpaid > 1 ? 's' : ''} completed, unpaid</div><div class="sub">collect the money</div></div></div>`)
+  return rows.length ? `<div class="list">${rows.join('')}</div>` : `<div class="needs-clear">Nothing's slipping. Go transmit.</div>`
 }
 function fmtReply(m) { if (m == null) return 'no replies yet'; if (m < 60) return m + 'm reply'; if (m < 1440) return Math.round(m / 60) + 'h reply'; return Math.round(m / 1440) + 'd reply' }
 async function viewPulse() {
   const d = await api('/api/pulse'); const e = d.energy || {}, v = d.voice || {}, om = d.oneMove || {}, g = d.goals || {}
+  const lc = e.label === 'Gaining' ? 'g' : e.label === 'Bleeding' ? 'b' : 'w'
   const deltaTxt = e.delta == null ? 'first read' : (e.delta > 0 ? `▲ ${e.delta} vs last` : e.delta < 0 ? `▼ ${Math.abs(e.delta)} vs last` : 'flat vs last')
   const bd = e.breakdown || {}
+  const tr = $('.topbar .right')
+  if (tr) { tr.innerHTML = `<span class="topdate">${new Date().toLocaleDateString('en-CA', { weekday: 'long', month: 'short', day: 'numeric' })}</span><button class="btn primary sm" id="newlead">${I.plus} New lead</button>`; const nl = $('#newlead'); if (nl) nl.onclick = openAddLead }
   setView(`
     <div class="pulse-grid">
-      <div class="energy-hero panel">${gauge(e.score || 0)}
+      <div class="energy-hero panel ${lc}">${gauge(e.score || 0)}
         <div class="energy-meta">
-          <div class="energy-label ${e.label === 'Gaining' ? 'g' : e.label === 'Bleeding' ? 'b' : 'w'}">${esc(e.label || '')}</div>
+          <div class="energy-label ${lc}">${esc(e.label || '')}</div>
           <div class="energy-delta">${deltaTxt}</div>
           <div class="energy-bd">${bdChip('Acquire', bd.acquisition)}${bdChip('Convert', bd.conversion)}${bdChip('Trust', bd.trust)}${bdChip('Cash', bd.cash)}</div>
         </div>
@@ -127,6 +147,10 @@ async function viewPulse() {
       ${voiceCard('Hear', `${v.hear ? v.hear.new_leads : 0} new`, v.hear && v.hear.status, 'inbound this week', 'Did anyone hear it?')}
       ${voiceCard('Respond', `${v.respond ? v.respond.open_leads : 0} open`, v.respond && v.respond.status, fmtReply(v.respond ? v.respond.median_reply : null), 'Did you answer fast?')}
     </div>
+    <div class="mini-panels" style="margin-top:var(--s5)">
+      <div class="panel"><div class="mini-h">Needs you</div>${needsPanel(d.needs)}</div>
+      <div class="panel"><div class="mini-h">Momentum · last 14 days</div>${sparkline(d.trend)}</div>
+    </div>
     <div class="sec-h"><span class="label">This week</span></div>
     <div class="panel goals-panel">
       ${goalBar('Leads', (v.hear ? v.hear.new_leads : 0) || 0, g.weekly_leads || 3)}
@@ -134,10 +158,16 @@ async function viewPulse() {
       ${goalBar('Posts', (v.transmit ? v.transmit.posts_wk : 0) || 0, g.posting_cadence || 3)}
     </div>
   `)
+  bindRows()
   const go = $('#om-go'); if (go) go.onclick = async () => {
     if (om.key === 'reply' && om.job_id) { openJob(om.job_id); return }
     await api('/api/pulse/action', { method: 'POST', body: JSON.stringify({ key: om.key }) }); renderApp('pulse')
   }
+  requestAnimationFrame(() => {
+    const ring = $('#gring'); if (ring) requestAnimationFrame(() => { ring.style.strokeDashoffset = ring.dataset.target })
+    countUp($('#gscore'), e.score || 0)
+    app.querySelectorAll('.goal__fill[data-w]').forEach((f) => { f.style.width = f.dataset.w })
+  })
 }
 
 /* ---------------- TODAY ---------------- */
