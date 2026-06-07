@@ -1,6 +1,6 @@
 // Cars With Fares — Command Center (vanilla SPA)
 let token = localStorage.getItem('cc_token') || ''
-let tab = 'today'
+let tab = 'pulse'
 const app = document.getElementById('app')
 const $ = (s, el = document) => el.querySelector(s)
 const money = (n) => '$' + Math.round(Number(n || 0)).toLocaleString()
@@ -26,8 +26,13 @@ const I = {
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L19 7"/></svg>',
 }
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
-const NAV = [['today', 'Today', I.today], ['pipeline', 'Pipeline', I.pipeline], ['money', 'Money', I.money], ['activation', 'Activation', I.bolt]]
-const TITLE = { today: 'Today', pipeline: 'Pipeline', money: 'Money', activation: 'Activation' }
+const NAV_GROUPS = [
+  ['Acquire', [['pulse', 'Pulse', I.spark]]],
+  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['money', 'Money', I.money]]],
+  ['Grow', [['activation', 'Activation', I.bolt]]],
+]
+const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
+const TITLE = { pulse: 'Pulse', pipeline: 'Pipeline', money: 'Money', activation: 'Activation' }
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -54,8 +59,7 @@ async function renderApp(next) {
     <div class="shell">
       <aside class="side">
         <div class="side__logo"><span class="chip">CWF</span><span>Command</span></div>
-        <div class="nav-group">Operate</div>
-        ${NAV.map(([k, l, ic]) => `<button class="nav-item ${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')}
+        ${NAV_GROUPS.map(([grp, items]) => `<div class="nav-group">${grp}</div>` + items.map(([k, l, ic]) => `<button class="nav-item ${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')).join('')}
         <div class="side__foot"><div class="side__biz"><span class="dot"></span>Cars With Fares</div></div>
       </aside>
       <div class="main">
@@ -63,10 +67,10 @@ async function renderApp(next) {
         <div class="view"><div class="loading">Loading…</div></div>
       </div>
     </div>
-    <nav class="bottombar">${NAV.map(([k, l, ic]) => `<button class="${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')}</nav>`
+    <nav class="bottombar">${FLAT.map(([k, l, ic]) => `<button class="${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')}</nav>`
   app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => renderApp(b.dataset.tab)))
   try {
-    if (tab === 'today') await viewToday()
+    if (tab === 'pulse') await viewPulse()
     else if (tab === 'pipeline') await viewPipeline()
     else if (tab === 'money') await viewMoney()
     else if (tab === 'activation') await viewActivation()
@@ -78,6 +82,62 @@ function tierBadge(j) {
   return `<span class="ai-score">${I.spark}Standard</span>`
 }
 function emptyState(ttl, sub) { return `<div class="empty"><div class="ic">${I.bolt}</div><div class="ttl">${esc(ttl)}</div><div class="sub">${esc(sub)}</div></div>` }
+
+/* ---------------- PULSE ---------------- */
+function gauge(score) {
+  const r = 54, circ = 2 * Math.PI * r, off = circ * (1 - Math.max(0, Math.min(100, score)) / 100)
+  const col = score >= 66 ? '#44D07F' : score >= 33 ? '#E0922E' : '#F6736B'
+  return `<svg viewBox="0 0 128 128" width="128" height="128" style="flex-shrink:0">
+    <circle cx="64" cy="64" r="${r}" fill="none" stroke="#1a1d22" stroke-width="10"/>
+    <circle cx="64" cy="64" r="${r}" fill="none" stroke="${col}" stroke-width="10" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 64 64)"/>
+    <text x="64" y="62" text-anchor="middle" fill="#F4F5F7" font-size="32" font-weight="700" font-family="'JetBrains Mono',monospace">${score}</text>
+    <text x="64" y="82" text-anchor="middle" fill="#868B98" font-size="9" letter-spacing="1.5">ENERGY</text></svg>`
+}
+function bdChip(name, val) { return `<span class="bd-chip"><span>${name}</span><b>${Math.round(val || 0)}</b></span>` }
+function voiceCard(title, value, status, sub, question) {
+  return `<div class="vcard"><div class="vh"><span class="vdot ${status || 'bad'}"></span><span class="vt">${title}</span></div>
+    <div class="vv">${esc(value)}</div><div class="vs">${esc(sub)}</div><div class="vq">${esc(question)}</div></div>`
+}
+function goalBar(name, val, target, isMoney) {
+  const pct = Math.min(100, Math.round((val / (target || 1)) * 100)); const f = (n) => isMoney ? money(n) : n
+  return `<div class="gb"><div class="gb__top"><span>${name}</span><b class="num">${f(val)} / ${f(target)}</b></div>
+    <div class="goal__track"><div class="goal__fill ${pct >= 100 ? 'over' : ''}" style="width:${pct}%"></div></div></div>`
+}
+async function viewPulse() {
+  const d = await api('/api/pulse'); const e = d.energy || {}, v = d.voice || {}, om = d.oneMove || {}, g = d.goals || {}
+  const deltaTxt = e.delta == null ? 'first read' : (e.delta > 0 ? `▲ ${e.delta} vs last` : e.delta < 0 ? `▼ ${Math.abs(e.delta)} vs last` : 'flat vs last')
+  const bd = e.breakdown || {}
+  setView(`
+    <div class="pulse-grid">
+      <div class="energy-hero panel">${gauge(e.score || 0)}
+        <div class="energy-meta">
+          <div class="energy-label ${e.label === 'Gaining' ? 'g' : e.label === 'Bleeding' ? 'b' : 'w'}">${esc(e.label || '')}</div>
+          <div class="energy-delta">${deltaTxt}</div>
+          <div class="energy-bd">${bdChip('Acquire', bd.acquisition)}${bdChip('Convert', bd.conversion)}${bdChip('Trust', bd.trust)}${bdChip('Cash', bd.cash)}</div>
+        </div>
+      </div>
+      <div class="one-move"><div class="om-tag">${I.bolt} Do this now</div>
+        <div class="om-title">${esc(om.title || '')}</div><div class="om-why">${esc(om.why || '')}</div>
+        ${om.cta ? `<button class="btn primary" id="om-go">${esc(om.cta)}</button>` : ''}</div>
+    </div>
+    <div class="sec-h"><span class="label">The voice</span></div>
+    <div class="triptych">
+      ${voiceCard('Transmit', `${v.transmit ? v.transmit.posts_wk : 0}/${v.transmit ? v.transmit.cadence : 3} posts`, v.transmit && v.transmit.status, v.transmit && v.transmit.findable ? 'Findable on Google' : 'Not findable yet', 'Did the voice go out?')}
+      ${voiceCard('Hear', `${v.hear ? v.hear.new_leads : 0} new`, v.hear && v.hear.status, 'inbound this week', 'Did anyone hear it?')}
+      ${voiceCard('Respond', `${v.respond ? v.respond.open_leads : 0} open`, v.respond && v.respond.status, v.respond && v.respond.median_reply == null ? 'no replies yet' : `${v.respond.median_reply}m reply`, 'Did you answer fast?')}
+    </div>
+    <div class="sec-h"><span class="label">This week</span></div>
+    <div class="panel goals-panel">
+      ${goalBar('Leads', (v.hear ? v.hear.new_leads : 0) || 0, g.weekly_leads || 3)}
+      ${goalBar('Revenue', d.rev_wk || 0, g.weekly_revenue || 1200, true)}
+      ${goalBar('Posts', (v.transmit ? v.transmit.posts_wk : 0) || 0, g.posting_cadence || 3)}
+    </div>
+  `)
+  const go = $('#om-go'); if (go) go.onclick = async () => {
+    if (om.key === 'reply' && om.job_id) { openJob(om.job_id); return }
+    await api('/api/pulse/action', { method: 'POST', body: JSON.stringify({ key: om.key }) }); renderApp('pulse')
+  }
+}
 
 /* ---------------- TODAY ---------------- */
 async function viewToday() {
@@ -283,4 +343,4 @@ function openAddLead() {
 }
 
 /* ---------------- boot ---------------- */
-if (token) renderApp('today'); else renderLogin()
+if (token) renderApp('pulse'); else renderLogin()

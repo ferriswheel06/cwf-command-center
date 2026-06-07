@@ -227,6 +227,88 @@ app.patch('/api/activation/:id', auth, async (c) => {
   return c.json({ ok: true })
 })
 
+// ---- PULSE (the acquisition engine) ----
+async function getJson(b, key, def) {
+  const r = (await q(`select value from settings where business_id=$1 and key=$2`, [b, key])).rows[0]
+  return r ? { ...def, ...r.value } : def
+}
+async function setJson(b, key, val) {
+  await q(`insert into settings (business_id,key,value) values ($1,$2,$3::jsonb)
+           on conflict (business_id,key) do update set value=$3::jsonb, updated_at=now()`, [b, key, JSON.stringify(val)])
+}
+const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)))
+
+app.get('/api/pulse', auth, async (c) => {
+  const b = biz(c)
+  const goals = await getJson(b, 'goals', { weekly_leads: 3, weekly_revenue: 1200, posting_cadence: 3 })
+  const signals = await getJson(b, 'signals', { gbp_claimed: false, reviews_count: 0, reviews_target: 10 })
+  const m = (await q(`select
+      count(*) filter (where status='lead' and created_at > now()-interval '7 days')::int as leads_wk,
+      count(*) filter (where status='lead')::int as open_leads,
+      count(*) filter (where status in ('lead','quoted') and created_at < now()-interval '3 days')::int as stale,
+      count(*) filter (where status in ('completed','paid'))::int as done_jobs,
+      count(*) filter (where status in ('completed','paid') and review_ask_sent_at is not null)::int as asked,
+      coalesce(sum(charge) filter (where status='paid' and paid_at > now()-interval '7 days'),0)::float as rev_wk,
+      count(*) filter (where status='scheduled')::int as booked
+    from jobs where business_id=$1`, [b])).rows[0]
+  const mr = (await q(`select percentile_cont(0.5) within group (order by extract(epoch from (first_contact_at-created_at))/60.0) as v
+      from jobs where business_id=$1 and first_contact_at is not null and status<>'lead'`, [b])).rows[0].v
+  const posts_wk = (await q(`select count(*)::int n from content where business_id=$1 and coalesce(posted_at,created_at) > now()-interval '7 days'`, [b])).rows[0].n
+  const reviewsGate = (await q(`select status from activation where business_id=$1 and key='reviews'`, [b])).rows[0]?.status
+  const hot = (await q(`select j.id, c.name as customer from jobs j join customers c on c.id=j.customer_id
+      where j.business_id=$1 and j.status='lead' and j.first_contact_at is null order by (j.ticket_tier='HIGH') desc, j.created_at limit 1`, [b])).rows[0]
+
+  const leadsS = clamp((m.leads_wk / (goals.weekly_leads || 3)) * 100)
+  const postsS = clamp((posts_wk / (goals.posting_cadence || 3)) * 100)
+  const findS = signals.gbp_claimed ? 100 : 0
+  const acquisition = clamp(0.4 * leadsS + 0.3 * postsS + 0.3 * findS)
+  const replyS = mr == null ? 50 : (mr <= 30 ? 100 : mr <= 60 ? 80 : mr <= 180 ? 50 : 20)
+  const staleS = clamp(100 - m.stale * 25)
+  const conversion = clamp((replyS + staleS) / 2)
+  const reviewsS = clamp((signals.reviews_count / (signals.reviews_target || 10)) * 100)
+  const askS = m.done_jobs ? clamp((m.asked / m.done_jobs) * 100) : 0
+  const trust = clamp(0.6 * reviewsS + 0.4 * askS)
+  const cashS = clamp((m.rev_wk / (goals.weekly_revenue || 1200)) * 100)
+  const cash = clamp((cashS + clamp(m.booked * 50)) / 2)
+  const score = clamp(0.4 * acquisition + 0.25 * conversion + 0.2 * trust + 0.15 * cash)
+
+  const prev = (await q(`select score from momentum where business_id=$1 and day < current_date order by day desc limit 1`, [b])).rows[0]
+  const delta = prev ? score - prev.score : null
+  await q(`insert into momentum (business_id,day,score,breakdown) values ($1,current_date,$2,$3::jsonb)
+           on conflict (business_id,day) do update set score=$2, breakdown=$3::jsonb`, [b, score, JSON.stringify({ acquisition, conversion, trust, cash })])
+
+  let oneMove
+  if (!signals.gbp_claimed) oneMove = { key: 'gbp', title: 'Claim + optimize your Google Business Profile', why: 'The loudest speaker you’re not using — local, ready-to-buy intent. The single biggest move on the board.', cta: 'Mark GBP claimed' }
+  else if (reviewsGate && reviewsGate !== 'done') oneMove = { key: 'reviews', title: 'Send your 2 review-ask texts (Rob + George)', why: '#1 Google Maps ranking lever — proof that lowers the trust barrier for the next stranger.', cta: 'Mark texts sent' }
+  else if (posts_wk < (goals.posting_cadence || 3)) oneMove = { key: 'post', title: 'Post today — keep the voice transmitting', why: 'Cadence is the voice. One a day beats ten in a burst.', cta: 'Log a post' }
+  else if (hot) oneMove = { key: 'reply', title: `Reply to ${hot.customer} — they’re waiting`, why: 'A delayed reply is a dead lead. Speed is the #1 close lever.', cta: 'Open lead', job_id: hot.id }
+  else oneMove = { key: 'steady', title: 'You’re transmitting — keep the cadence', why: 'Ask every happy customer for a review. Each one makes the next stranger trust you faster.', cta: null }
+
+  const label = score >= 66 ? 'Gaining' : score >= 33 ? 'Warming' : 'Bleeding'
+  return c.json({
+    energy: { score, delta, label, breakdown: { acquisition, conversion, trust, cash } },
+    voice: {
+      transmit: { posts_wk, cadence: goals.posting_cadence || 3, findable: signals.gbp_claimed, status: postsS >= 66 ? 'good' : posts_wk > 0 ? 'warn' : 'bad' },
+      hear: { new_leads: m.leads_wk, status: m.leads_wk > 0 ? 'good' : 'bad' },
+      respond: { open_leads: m.open_leads, median_reply: mr == null ? null : Math.round(mr), status: replyS >= 80 ? 'good' : replyS >= 50 ? 'warn' : 'bad' },
+    },
+    oneMove, goals, signals, rev_wk: m.rev_wk, needs: { stale: m.stale, hot: hot || null },
+  })
+})
+app.post('/api/pulse/action', auth, async (c) => {
+  const b = biz(c), d = await c.req.json().catch(() => ({}))
+  if (d.key === 'gbp') { const s = await getJson(b, 'signals', {}); s.gbp_claimed = true; await setJson(b, 'signals', s) }
+  else if (d.key === 'reviews') {
+    await q(`update activation set status='done', updated_at=now() where business_id=$1 and key='reviews'`, [b])
+    const s = await getJson(b, 'signals', { reviews_count: 0 }); s.reviews_count = (s.reviews_count || 0) + 2; await setJson(b, 'signals', s)
+  } else if (d.key === 'post') {
+    await q(`insert into content (business_id,title,status,posted_at) values ($1,$2,'posted',now())`, [b, d.title || 'Post'])
+  }
+  return c.json({ ok: true })
+})
+app.get('/api/goals', auth, async (c) => c.json(await getJson(biz(c), 'goals', { weekly_leads: 3, weekly_revenue: 1200, posting_cadence: 3 })))
+app.put('/api/goals', auth, async (c) => { await setJson(biz(c), 'goals', await c.req.json().catch(() => ({}))); return c.json({ ok: true }) })
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
