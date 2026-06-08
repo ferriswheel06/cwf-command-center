@@ -29,6 +29,10 @@ const SAFETY_RE = /brake|steering|overheat|knock|smoke|stall|grinding|wobble|no.
 const tierOf = (issue, est) => (Number(est) || 0) >= 700 || HIGH_RE.test(issue || '') ? 'HIGH' : 'STANDARD'
 const safetyOf = (issue) => SAFETY_RE.test(issue || '')
 
+// Asset kinds — ONE module-level source reused everywhere (per-job assets, library filter, R2 uploads).
+// kind: photo | clip | quote | invoice | doc
+const ASSET_KINDS = ['photo', 'clip', 'quote', 'invoice', 'doc']
+
 // --- seed the 2 real jobs the first time ---
 async function seedIfEmpty() {
   try {
@@ -132,7 +136,10 @@ app.post('/api/jobs/:id/advance', auth, async (c) => {
   if (!cur) return c.json({ error: 'not found' }, 404)
   const i = FLOW.indexOf(cur.status)
   const next = i >= 0 && i < FLOW.length - 1 ? FLOW[i + 1] : cur.status
-  await q(`update jobs set status=$1${next === 'paid' ? ', paid_at=now()' : ''} where id=$2 and business_id=$3`, [next, id, b])
+  // stamp completion/payment timestamps on the transition INTO that stage (coalesce so they're never overwritten on a re-advance)
+  const stamp = next === 'paid' ? ', paid_at=coalesce(paid_at,now())'
+    : next === 'completed' ? ', completed_at=coalesce(completed_at,now())' : ''
+  await q(`update jobs set status=$1${stamp} where id=$2 and business_id=$3`, [next, id, b])
   await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'status_change',$3)`, [b, id, `→ ${next}`])
   return c.json({ status: next })
 })
@@ -242,6 +249,54 @@ async function setJson(b, key, val) {
            on conflict (business_id,key) do update set value=$3::jsonb, updated_at=now()`, [b, key, JSON.stringify(val)])
 }
 const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)))
+
+// ---- WON WORKFLOW (shared) — winning a job collapses the overhead into one move ----
+// Sets status=scheduled + quote_status=accepted, auto-creates the review-ask + photo-capture
+// tasks, and logs it. Idempotent: dedupes the checklist tasks so calling it twice (e.g. /won
+// then a quote marked 'accepted') can't double-create them. Tenant-scoped via b. Flat, no tax.
+async function fireWonWorkflow(b, jobId) {
+  const job = (await q(`select j.id, j.customer_id, j.charge, j.parts_cost, j.gas_cost, j.scheduled_date, j.status, j.quote_status,
+      c.name as customer, nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
+    from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id
+    where j.id=$1 and j.business_id=$2`, [jobId, b])).rows[0]
+  if (!job) return null
+  const profit = (Number(job.charge) || 0) - (Number(job.parts_cost) || 0) - (Number(job.gas_cost) || 0)
+  // don't downgrade a job already further along the flow — only nudge lead/quoted forward to scheduled
+  const nextStatus = ['lead', 'quoted'].includes(job.status) ? 'scheduled' : job.status
+  const alreadyWon = job.quote_status === 'accepted'
+  await q(`update jobs set status=$1, quote_status='accepted' where id=$2 and business_id=$3`, [nextStatus, jobId, b])
+  if (!alreadyWon) {
+    await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'status_change',$4)`,
+      [b, jobId, job.customer_id, `Marked WON → ${nextStatus} ✓ (flat $${Number(job.charge) || 0} · profit $${profit})`])
+  }
+  const who = job.customer || 'the customer'
+  const ride = job.vehicle ? ` on the ${job.vehicle}` : ''
+  const checklist = []
+  // 1) review-ask task — ask every happy customer, every time (dedupe: one open review_ask per job)
+  const reviewTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status)
+      select $1,$2,$3,'review_ask',$4,$5,'open'
+      where not exists (select 1 from tasks where business_id=$1 and job_id=$2 and kind='review_ask' and status='open')
+      returning id, title`,
+    [b, jobId, job.customer_id, `Ask ${who} for a Google review`,
+      `After the job${ride} is done — send the review-ask text. Each review makes the next stranger trust you faster.`])).rows[0]
+  if (reviewTask) checklist.push({ kind: 'review_ask', task_id: reviewTask.id, title: reviewTask.title, when: 'after the job' })
+  // 2) photo-capture reminder — recontact due after the job (default 1 day out, or scheduled_date if known)
+  const photoDue = job.scheduled_date
+    ? `(date '${new Date(job.scheduled_date).toISOString().slice(0, 10)}' + 1)::timestamptz`
+    : `(current_date + 1)::timestamptz`
+  const photoTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status,due_at)
+      select $1,$2,$3,'recontact',$4,$5,'open',${photoDue}
+      where not exists (select 1 from tasks where business_id=$1 and job_id=$2 and kind='recontact' and status='open' and title like 'Grab before/after photos%')
+      returning id, title, due_at`,
+    [b, jobId, job.customer_id, `Grab before/after photos${ride}`,
+      `Capture the job photos/clips — they become content and the proof you drop to close the next hesitant prospect.`])).rows[0]
+  if (photoTask) checklist.push({ kind: 'recontact', task_id: photoTask.id, title: photoTask.title, when: 'after the job', due_at: photoTask.due_at })
+  return {
+    ok: true, status: nextStatus, quote_status: 'accepted',
+    charge: Number(job.charge) || 0, profit, below_floor: profit < 1000,
+    already_won: alreadyWon, checklist,
+  }
+}
 
 app.get('/api/pulse', auth, async (c) => {
   const b = biz(c)
@@ -359,7 +414,14 @@ app.post('/api/quotes/:id/status', auth, async (c) => {
   const profit = (Number(job.charge) || 0) - (Number(job.parts_cost) || 0) - (Number(job.gas_cost) || 0)
   const label = qs === 'sent' ? `Quote sent — ${Number(job.charge) || 0} · profit ${profit}` : qs === 'accepted' ? 'Quote accepted ✓' : 'Quote declined'
   await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'quote',$3)`, [b, id, label])
-  return c.json({ quote_status: qs, status: jobStatus, profit, below_floor: profit < 1000 })
+  // accepting a quote = winning the job: fire the shared won workflow (review-ask + photo tasks).
+  // idempotent + deduped, so it won't double-create even if /won already ran.
+  let checklist
+  if (qs === 'accepted') {
+    const won = await fireWonWorkflow(b, id)
+    if (won) { jobStatus = won.status; checklist = won.checklist }
+  }
+  return c.json({ quote_status: qs, status: jobStatus, profit, below_floor: profit < 1000, ...(checklist ? { checklist } : {}) })
 })
 
 // ---- GONE-QUIET detector — anything not moved in 3+ days raises its hand ----
@@ -382,7 +444,7 @@ app.get('/api/closeout', auth, async (c) => {
   const today = (await q(`select
       count(*) filter (where status='lead' and created_at::date = current_date)::int as new_leads,
       count(*) filter (where quote_sent_at::date = current_date)::int as quotes_sent,
-      count(*) filter (where status='completed' and updated_at::date = current_date)::int as completed,
+      count(*) filter (where status='completed' and completed_at::date = current_date)::int as completed,
       count(*) filter (where status='paid' and paid_at::date = current_date)::int as paid_jobs,
       coalesce(sum(charge) filter (where status='paid' and paid_at::date = current_date),0)::float as collected
     from jobs where business_id=$1`, [b])).rows[0]
@@ -521,8 +583,7 @@ app.get('/api/triage', auth, async (c) => {
 })
 
 // ---- ASSETS (Wave 3: file & photo drop per lead) — paste-a-link for now, no binary infra ----
-// kind: photo | clip | quote | invoice | doc
-const ASSET_KINDS = ['photo', 'clip', 'quote', 'invoice', 'doc']
+// kind list lives in the module-level ASSET_KINDS const (top of file).
 app.get('/api/jobs/:id/assets', auth, async (c) => {
   const id = c.req.param('id'), b = biz(c)
   const job = (await q(`select id from jobs where id=$1 and business_id=$2`, [id, b])).rows[0]
@@ -672,40 +733,9 @@ app.post('/api/recontact/:id/done', auth, async (c) => {
 // status=scheduled + quote_status=accepted, auto-create review-ask + photo-capture reminder, log it.
 app.post('/api/jobs/:id/won', auth, async (c) => {
   const id = c.req.param('id'), b = biz(c)
-  const job = (await q(`select j.id, j.customer_id, j.charge, j.parts_cost, j.gas_cost, j.scheduled_date,
-      c.name as customer, nullif(trim(concat_ws(' ', v.year::text, v.make, v.model)),'') as vehicle
-    from jobs j join customers c on c.id=j.customer_id left join vehicles v on v.id=j.vehicle_id
-    where j.id=$1 and j.business_id=$2`, [id, b])).rows[0]
-  if (!job) return c.json({ error: 'not found' }, 404)
-  const profit = (Number(job.charge) || 0) - (Number(job.parts_cost) || 0) - (Number(job.gas_cost) || 0)
-  await q(`update jobs set status='scheduled', quote_status='accepted' where id=$1 and business_id=$2`, [id, b])
-  await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'status_change',$4)`,
-    [b, id, job.customer_id, `Marked WON → scheduled ✓ (flat $${Number(job.charge) || 0} · profit $${profit})`])
-  const who = job.customer || 'the customer'
-  const ride = job.vehicle ? ` on the ${job.vehicle}` : ''
-  const checklist = []
-  // 1) review-ask task — ask every happy customer, every time
-  const reviewTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status)
-      values ($1,$2,$3,'review_ask',$4,$5,'open')
-      returning id, title`,
-    [b, id, job.customer_id, `Ask ${who} for a Google review`,
-      `After the job${ride} is done — send the review-ask text. Each review makes the next stranger trust you faster.`])).rows[0]
-  checklist.push({ kind: 'review_ask', task_id: reviewTask.id, title: reviewTask.title, when: 'after the job' })
-  // 2) photo-capture reminder — recontact due after the job (default 1 day out, or scheduled_date if known)
-  const photoDue = job.scheduled_date
-    ? `(date '${new Date(job.scheduled_date).toISOString().slice(0, 10)}' + 1)::timestamptz`
-    : `(current_date + 1)::timestamptz`
-  const photoTask = (await q(`insert into tasks (business_id,job_id,customer_id,kind,title,body,status,due_at)
-      values ($1,$2,$3,'recontact',$4,$5,'open',${photoDue})
-      returning id, title, due_at`,
-    [b, id, job.customer_id, `Grab before/after photos${ride}`,
-      `Capture the job photos/clips — they become content and the proof you drop to close the next hesitant prospect.`])).rows[0]
-  checklist.push({ kind: 'recontact', task_id: photoTask.id, title: photoTask.title, when: 'after the job', due_at: photoTask.due_at })
-  return c.json({
-    ok: true, status: 'scheduled', quote_status: 'accepted',
-    charge: Number(job.charge) || 0, profit, below_floor: profit < 1000,
-    checklist,
-  })
+  const result = await fireWonWorkflow(b, id)
+  if (!result) return c.json({ error: 'not found' }, 404)
+  return c.json(result)
 })
 
 // ---- REVIEW ASK + GOT TRACKING — ask every happy customer, track ask-rate + got-rate ----
@@ -1304,7 +1334,7 @@ const r2Down = (c) => c.json({ error: 'storage not configured yet' }, 503)
 const GET_TTL = 3600   // 1h presigned GET — long enough to play/scrub a clip
 const PUT_TTL = 3600   // 1h presigned PUT — covers a slow driveway-LTE upload
 
-const ASSET_KIND_SET = ['photo', 'clip', 'quote', 'invoice', 'doc']
+// asset kinds reuse the single module-level ASSET_KINDS const (top of file)
 const safeExt = (filename) => {
   const m = /\.([a-z0-9]{1,8})$/i.exec((filename || '').toString())
   return m ? m[1].toLowerCase() : 'bin'
@@ -1396,7 +1426,7 @@ app.post('/api/uploads/record', auth, async (c) => {
   const b = biz(c), d = await c.req.json().catch(() => ({}))
   const key = (d.r2_key || '').toString().trim()
   if (!key) return c.json({ error: 'need r2_key' }, 400)
-  const kind = ASSET_KIND_SET.includes(d.kind) ? d.kind : 'photo'
+  const kind = ASSET_KINDS.includes(d.kind) ? d.kind : 'photo'
   let jobId = null, customerId = null
   if (d.job_id) { const job = await ownedJob(b, d.job_id); if (!job) return c.json({ error: 'job not found' }, 404); jobId = job.id; customerId = job.customer_id }
   const mime = (d.mime || '').toString().trim() || null
@@ -1424,7 +1454,7 @@ app.get('/api/vault', auth, async (c) => {
   const jobId = (c.req.query('job_id') || '').toString().trim()
   const params = [b]
   let where = `a.business_id=$1`
-  if (kind && ASSET_KIND_SET.includes(kind)) { params.push(kind); where += ` and a.kind=$${params.length}` }
+  if (kind && ASSET_KINDS.includes(kind)) { params.push(kind); where += ` and a.kind=$${params.length}` }
   if (jobId && /^\d+$/.test(jobId)) { params.push(Number(jobId)); where += ` and a.job_id=$${params.length}` }
   if (search) {
     params.push(`%${search}%`)
@@ -1849,8 +1879,9 @@ app.get('/api/calendar/content', auth, async (c) => {
 })
 
 // ---- THE CONTENT FUNNEL — Posts -> Reach -> Leads -> (Booked/Revenue), per channel + $/post ----
-// Honest where data is thin: zeros, not invented numbers. Lead count blends the legacy
-// content.leads_attributed (piece-level, pre-Phase-3) with the new per-channel content_posts.leads.
+// Honest where data is thin: zeros, not invented numbers. Lead count = per-channel content_posts.leads
+// (single source of truth — no double-count). Legacy piece-level content.leads_attributed is surfaced
+// read-only as totals.legacy_leads, never folded into the headline `leads`.
 // Booked/revenue ties leads to paid jobs sourced from content (jobs.source like 'website%'/'content%')
 // — attributable but coarse, flagged as such so he reads it honestly.
 app.get('/api/funnel', auth, async (c) => {
@@ -1879,15 +1910,16 @@ app.get('/api/funnel', auth, async (c) => {
     leads: r.post_leads || 0,
     cost_per_post: 0,                          // organic — $0; column exists so the UI can show $/post honestly
   })).sort((a, z) => z.posts - a.posts || z.reach - a.reach)
+  // SINGLE SOURCE OF TRUTH for leads = per-channel content_posts.leads (no double-count).
+  // legacy content.leads_attributed is surfaced read-only as `legacy_leads`, never folded into `leads`.
   const channelPostLeads = channels.reduce((s, r) => s + r.leads, 0)
-  // total content leads = the new per-channel leads + the legacy piece-level attribution
-  const totalLeads = channelPostLeads + (legacy.n || 0)
+  const totalLeads = channelPostLeads
   const totals = {
     posts: channels.reduce((s, r) => s + r.posts, 0),
     planned: channels.reduce((s, r) => s + r.planned, 0),
     reach: channels.reduce((s, r) => s + r.reach, 0),
     channel_leads: channelPostLeads,
-    legacy_leads: legacy.n || 0,
+    legacy_leads: legacy.n || 0,   // read-only piece-level attribution (pre-Phase-3) — NOT in `leads`
     leads: totalLeads,
     posted_pieces: legacy.posted_pieces || 0,
     pieces: legacy.pieces || 0,

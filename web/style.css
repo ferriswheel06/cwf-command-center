@@ -1143,3 +1143,48 @@ textarea.input.ta{height:auto}
 .pb-acts{flex-wrap:wrap}
 .pb-drawer .drawer__b{overflow-x:hidden}
 
+/* ===================== STREAMLINE · nav overflow, Pulse-as-home, drawer one-move ===================== */
+/* "More" rail button sits in the sidebar foot, above the biz line */
+.side__foot{display:flex;flex-direction:column;gap:var(--s2)}
+.nav-more{margin-bottom:var(--s1)}
+.nav-more svg{width:18px;height:18px}
+
+/* the More overflow popover (sidebar + mobile kebab share it) */
+.overflow-wrap{position:fixed;inset:0;z-index:120}
+.overflow-scrim{position:absolute;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(2px)}
+.overflow-pop{position:absolute;left:var(--s3);bottom:64px;width:230px;background:var(--bg2);
+  border:1px solid var(--line);border-radius:var(--r3);box-shadow:var(--shadow-pop,0 20px 50px -16px rgba(0,0,0,.8));
+  padding:var(--s2);display:flex;flex-direction:column;gap:2px;animation:popin var(--ts,.16s) var(--ease)}
+@keyframes popin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.overflow-pop__h{font:600 10px/1 var(--font);letter-spacing:.1em;text-transform:uppercase;color:var(--fg4);padding:var(--s2) var(--s2) var(--s1)}
+.overflow-item{display:flex;align-items:center;gap:var(--s3);height:38px;padding:0 var(--s3);border-radius:var(--r2);
+  color:var(--fg2);font:550 13px/1 var(--font);width:100%;text-align:left;transition:color var(--tf),background var(--tf)}
+.overflow-item svg{width:17px;height:17px;flex-shrink:0;stroke-width:1.75}
+.overflow-item:hover{color:var(--fg);background:rgba(255,255,255,.05)}
+.overflow-item.on{color:var(--fg);background:var(--accent-d)}
+@media(max-width:768px){.overflow-pop{left:50%;transform:translateX(-50%);bottom:calc(72px + env(safe-area-inset-bottom));width:min(320px,86vw)}
+  @keyframes popin{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}}
+
+/* Pulse "Who to touch now" — the /api/today ranked list under the one-move */
+.touch-panel{padding:var(--s3) var(--s4)}
+.touch-h{display:flex;align-items:center;gap:var(--s2);margin:var(--s3) 0 var(--s2);
+  font:600 11px/1 var(--font);letter-spacing:.06em;text-transform:uppercase;color:var(--fg3)}
+.touch-h:first-child{margin-top:0}
+.touch-h .ct{margin-left:auto;font:600 11px/1 var(--mono);color:var(--fg4)}
+
+/* slipping panels on Pulse span the full mini-panels grid so their rows breathe */
+.mini-panels .quiet-panel,.mini-panels .attn-panel{grid-column:1 / -1}
+.rc-panel{grid-column:1 / -1}
+.rc-up{margin-left:var(--s2);font:600 11px/1 var(--mono);color:var(--accent)}
+
+/* job-drawer one-move: a primary action, the rest behind "More" */
+.drawer-acts{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center}
+.drawer-acts .dprimary{flex:1;min-width:140px}
+.drawer-more{display:flex;gap:var(--s2);flex-wrap:wrap;width:100%;margin-top:var(--s2);
+  padding-top:var(--s3);border-top:1px solid var(--line)}
+.drawer-more[hidden]{display:none}
+
+/* Pipeline mode toggle reuses .seg; just the icon tint */
+.seg.pipe-mode button.on svg{stroke:var(--accent)}
+.seg.pipe-mode button .spark,.seg.pipe-mode button svg[fill]{fill:currentColor}
+

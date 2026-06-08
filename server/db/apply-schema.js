@@ -109,6 +109,10 @@ const MIGRATIONS = [
      created_at timestamptz not null default now())`,
   `create index if not exists assets_job_idx on assets (business_id, job_id, created_at)`,
   `alter table jobs add column if not exists review_received_at timestamptz`,
+  `alter table jobs add column if not exists completed_at timestamptz`,
+  // backfill: best-effort stamp for jobs already past 'completed' (mirrors paid_at logic; updated_at is unreliable per the jobs_updated trigger, so fall back to paid_at then created_at)
+  `update jobs set completed_at = coalesce(paid_at, created_at) where completed_at is null and status in ('completed','paid')`,
+  `create index if not exists jobs_completed_at_idx on jobs (business_id, completed_at)`,
   `alter type task_kind add value if not exists 'recontact'`,
   `create index if not exists tasks_recontact_due_idx on tasks (business_id, kind, status, due_at)`,
   `create table if not exists proof (

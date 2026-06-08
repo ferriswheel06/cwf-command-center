@@ -10,7 +10,10 @@ const ago = (d) => { if (!d) return ''; const s = (Date.now() - new Date(d).getT
 async function api(path, opts = {}) {
   const r = await fetch(path, { ...opts, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}), ...(opts.headers || {}) } })
   if (r.status === 401) { token = ''; localStorage.removeItem('cc_token'); renderLogin(); throw new Error('401') }
-  return r.json()
+  const data = await r.json().catch(() => ({}))
+  // Global write-failure surfacing: a failed tap should never silently do nothing.
+  if (!r.ok && typeof toast === 'function') toast((data && (data.error || data.message)) || `That didn't go through (${r.status})`, 'warn')
+  return data
 }
 
 const I = {
@@ -24,16 +27,46 @@ const I = {
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 5v14M5 12h14"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L19 7"/></svg>',
+  numbers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
+  users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="9" cy="8" r="3.2"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 5a3 3 0 0 1 0 6M21 20a6 6 0 0 0-4-5.6"/></svg>',
+  vault: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="12" cy="12" r="3.2"/><path d="M12 8.8v-1M15.2 12h1"/></svg>',
+  more: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>',
+}
+// One canonical status→pill-class map. Every status vocabulary (jobs, quotes, content
+// stages, handoffs) routes through PILL so the pill CSS classes stay in sync.
+const PILL = {
+  // job/lead lifecycle
+  lead: 'lead', quoted: 'quoted', scheduled: 'scheduled', in_progress: 'in_progress', completed: 'completed', paid: 'paid', lost: 'lost',
+  // quote status
+  draft: 'lead', sent: 'quoted', accepted: 'scheduled', declined: 'lost',
+  // content pipeline stages
+  idea: 'lead', raw: 'lead', editing: 'in_progress', ready: 'completed', posted: 'completed',
+  // playbook / handoff
+  todo: 'lead', doing: 'in_progress', done: 'completed', new: 'lead',
 }
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
+// 9 rail items in 3 groups. Everything else lives behind the "More" overflow.
 const NAV_GROUPS = [
-  ['Acquire', [['pulse', 'Pulse', I.spark], ['triage', 'Triage', I.bolt]]],
-  ['Operate', [['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today], ['quotes', 'Quotes', I.money], ['customers', 'Customers', I.today], ['money', 'Money', I.money]]],
-  ['Grow', [['field', 'Field', I.pipeline], ['activation', 'Activation', I.bolt], ['proof', 'Proof', I.check], ['content', 'Studio', I.spark]]],
-  ['Plan', [['handoffs', 'To Claude Code', I.spark], ['vault', 'Vault', I.spark], ['templates', 'Templates', I.arrow], ['backburner', 'Back-burner', I.arrow]]],
+  ['Day', [['pulse', 'Pulse', I.spark], ['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today]]],
+  ['Grow', [['quotes', 'Quotes', I.money], ['customers', 'Customers', I.users], ['numbers', 'Numbers', I.numbers], ['content', 'Studio', I.spark]]],
+  ['Turn it on', [['activation', 'Activation', I.bolt], ['vault', 'Vault', I.vault]]],
+]
+// The overflow drawer — config + low-frequency surfaces, off the permanent rail.
+const NAV_OVERFLOW = [
+  ['handoffs', 'To Claude Code', I.spark],
+  ['proof', 'Proof', I.check],
+  ['templates', 'Templates', I.arrow],
+  ['backburner', 'Back-burner', I.arrow],
+  ['attention', 'Brief settings', I.bolt],
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
-const TITLE = { pulse: 'Pulse', triage: 'Triage', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers', money: 'Money', field: 'Field', activation: 'Activation', proof: 'Proof', content: 'Studio', handoffs: 'To Claude Code', vault: 'Vault', assets: 'Vault', templates: 'Templates', backburner: 'Back-burner' }
+const TITLE = {
+  pulse: 'Pulse', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers',
+  numbers: 'Numbers', content: 'Studio', activation: 'Activation', vault: 'Vault',
+  handoffs: 'To Claude Code', proof: 'Proof', templates: 'Templates', backburner: 'Back-burner', attention: 'Brief settings',
+  // old keys kept mapped so deep-links / setView calls never render undefined
+  triage: 'Pipeline', money: 'Numbers', field: 'Numbers', assets: 'Vault', today: 'Pulse', studio: 'Studio',
+}
 
 /* ---------------- login ---------------- */
 function renderLogin(msg = '') {
@@ -50,7 +83,7 @@ function renderLogin(msg = '') {
 async function login() {
   const r = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: $('#pw').value }) })
   if (!r.ok) return renderLogin('Wrong password')
-  token = (await r.json()).token; localStorage.setItem('cc_token', token); renderApp('today')
+  token = (await r.json()).token; localStorage.setItem('cc_token', token); renderApp('pulse')
 }
 
 /* ---------------- shell ---------------- */
@@ -65,33 +98,56 @@ async function renderApp(next) {
           <span class="side__wm"><b>Cars With Fares</b><i>Command Center</i></span>
         </div>
         ${NAV_GROUPS.map(([grp, items]) => `<div class="nav-group">${grp}</div>` + items.map(([k, l, ic]) => `<button class="nav-item ${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')).join('')}
-        <div class="side__foot"><div class="side__biz"><span class="dot"></span>Cars With Fares</div></div>
+        <div class="side__foot">
+          <button class="nav-item nav-more ${NAV_OVERFLOW.some(([k]) => k === tab) ? 'on' : ''}" id="nav-more">${I.more}<span>More</span></button>
+          <div class="side__biz"><span class="dot"></span>Cars With Fares</div>
+        </div>
       </aside>
       <div class="main">
         <header class="topbar"><h1>${TITLE[tab]}</h1><div class="right"></div></header>
         <div class="view"><div class="loading">Loading…</div></div>
       </div>
     </div>
-    <nav class="bottombar">${FLAT.map(([k, l, ic]) => `<button class="${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')}</nav>`
+    <nav class="bottombar">${FLAT.map(([k, l, ic]) => `<button class="${k === tab ? 'on' : ''}" data-tab="${k}">${ic}<span>${l}</span></button>`).join('')}<button class="${NAV_OVERFLOW.some(([k]) => k === tab) ? 'on' : ''}" id="nav-more-m">${I.more}<span>More</span></button></nav>`
   app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => renderApp(b.dataset.tab)))
+  bindOverflow()
   try {
-    if (tab === 'pulse') await viewPulse()
-    else if (tab === 'pipeline') await viewPipeline()
-    else if (tab === 'money') await viewMoney()
-    else if (tab === 'activation') await viewActivation()
-    else if (tab === 'quotes') await viewQuotes()
-    else if (tab === 'backburner') await viewBackburner()
-else if (tab === 'triage') await viewTriage()
-else if (tab === 'customers') await viewCustomers()
-else if (tab === 'templates') await viewTemplates()
-else if (tab === 'proof') await viewProof()
-else if (tab === 'content') await viewContent()
-else if (tab === 'vault') await viewVault()
-else if (tab === 'assets') await viewVault()
-else if (tab === 'calendar') await viewCalendar()
-else if (tab === 'field') await viewField()
-else if (tab === 'handoffs') await viewHandoffs()
+    const view = VIEWS[tab] || VIEWS.pulse
+    await view()
   } catch (e) { /* 401 handled */ }
+}
+
+// One router map replaces the if/else chain. Aliases keep old keys / deep-links alive:
+// field+money fold into Numbers, triage into Pipeline, assets into Vault, today into Pulse.
+const VIEWS = {
+  pulse: viewPulse, pipeline: viewPipeline, calendar: viewCalendar,
+  quotes: viewQuotes, customers: viewCustomers, numbers: viewNumbers,
+  content: viewContent, studio: viewContent, activation: viewActivation, vault: viewVault,
+  handoffs: viewHandoffs, templates: viewTemplates, backburner: viewBackburner, proof: viewProof,
+  attention: viewAttention,
+  // aliases — never let a stale key hit a dead route
+  field: viewNumbers, money: viewNumbers, triage: viewPipeline, assets: viewVault, today: viewPulse,
+}
+
+// The "More" overflow: a small panel of config + low-frequency surfaces, each navigating via setView.
+function bindOverflow() {
+  const open = () => openOverflow()
+  const a = $('#nav-more'); if (a) a.onclick = open
+  const b = $('#nav-more-m'); if (b) b.onclick = open
+}
+function openOverflow() {
+  if ($('.overflow-pop')) { $('.overflow-pop').closest('.overflow-wrap').remove(); return }
+  const wrap = document.createElement('div')
+  wrap.className = 'overflow-wrap'
+  wrap.innerHTML = `<div class="overflow-scrim"></div>
+    <div class="overflow-pop">
+      <div class="overflow-pop__h">More</div>
+      ${NAV_OVERFLOW.map(([k, l, ic]) => `<button class="overflow-item ${k === tab ? 'on' : ''}" data-of="${k}">${ic}<span>${l}</span></button>`).join('')}
+    </div>`
+  document.body.appendChild(wrap)
+  const close = () => wrap.remove()
+  $('.overflow-scrim', wrap).onclick = close
+  wrap.querySelectorAll('[data-of]').forEach((el) => (el.onclick = () => { close(); renderApp(el.dataset.of) }))
 }
 
 function tierBadge(j) {
@@ -141,13 +197,30 @@ function needsPanel(n) {
   return rows.length ? `<div class="list">${rows.join('')}</div>` : `<div class="needs-clear">Nothing's slipping. Go transmit.</div>`
 }
 function fmtReply(m) { if (m == null) return 'no replies yet'; if (m < 60) return m + 'm reply'; if (m < 1440) return Math.round(m / 60) + 'h reply'; return Math.round(m / 1440) + 'd reply' }
+// Pulse is the single daily home: score → the one move → the ranked list of who to touch →
+// the slipping panels (gone-quiet, re-contact, attention). All inline, one render, no monkey-patch.
 async function viewPulse() {
-  const d = await api('/api/pulse'); const e = d.energy || {}, v = d.voice || {}, om = d.oneMove || {}, g = d.goals || {}
+  // pull everything the daily cockpit needs in parallel; tolerate any single endpoint failing
+  const [d, today, quiet, rc, attn] = await Promise.all([
+    api('/api/pulse'),
+    api('/api/today').catch(() => ({})),
+    api('/api/quiet').catch(() => ({ quiet: [] })),
+    api('/api/recontact').catch(() => ({ due: [], count: {} })),
+    api('/api/attention').catch(() => ({})),
+  ])
+  const e = d.energy || {}, v = d.voice || {}, om = d.oneMove || {}, g = d.goals || {}
   const lc = e.label === 'Gaining' ? 'g' : e.label === 'Bleeding' ? 'b' : 'w'
   const deltaTxt = e.delta == null ? 'first read' : (e.delta > 0 ? `▲ ${e.delta} vs last` : e.delta < 0 ? `▼ ${Math.abs(e.delta)} vs last` : 'flat vs last')
   const bd = e.breakdown || {}
   const tr = $('.topbar .right')
-  if (tr) { tr.innerHTML = `<span class="topdate">${new Date().toLocaleDateString('en-CA', { weekday: 'long', month: 'short', day: 'numeric' })}</span><button class="btn primary sm" id="newlead">${I.plus} New lead</button>`; const nl = $('#newlead'); if (nl) nl.onclick = openAddLead }
+  if (tr) { tr.innerHTML = `<span class="topdate">${new Date().toLocaleDateString('en-CA', { weekday: 'long', month: 'short', day: 'numeric' })}</span><button class="btn ghost sm" id="closeout-btn">${I.check} Close out</button><button class="btn primary sm" id="newlead">${I.plus} New lead</button>` }
+  // "Who to touch now" — the /api/today ranked list (callFirst → scheduledToday → stale → unpaid)
+  const touchSec = (title, rows, hint) => rows && rows.length
+    ? `<div class="touch-h"><span>${esc(title)}</span><span class="ct">${rows.length}</span></div><div class="list">${rows.map(leadRow).join('')}</div>`
+    : (hint ? `<div class="touch-h"><span>${esc(title)}</span></div><div class="lrow" style="color:var(--fg4);justify-content:center">${esc(hint)}</div>` : '')
+  const anyTouch = (today.callFirst || []).length || (today.scheduledToday || []).length || (today.stale || []).length || (today.unpaid || []).length
+  // re-contact due-now rows
+  const rcDue = (rc.due || []), rcUpcoming = rc.count ? (rc.count.upcoming || 0) : 0
   setView(`
     <div class="pulse-grid">
       <div class="energy-hero panel ${lc}">${gauge(e.score || 0)}
@@ -161,6 +234,17 @@ async function viewPulse() {
         <div class="om-title">${esc(om.title || '')}</div><div class="om-why">${esc(om.why || '')}</div>
         ${om.cta ? `<button class="btn primary" id="om-go">${esc(om.cta)}</button>` : ''}</div>
     </div>
+
+    <div class="sec-h"><span class="label">Who to touch now</span></div>
+    <div class="panel touch-panel">
+      ${anyTouch ? `
+        ${touchSec('Call first', today.callFirst, 'No leads to call — turn on an activation gate.')}
+        ${touchSec('Scheduled today', today.scheduledToday)}
+        ${touchSec('Going stale', today.stale)}
+        ${touchSec('Money owed', today.unpaid)}`
+        : `<div class="needs-clear">Nothing waiting. Pipeline's clean — go transmit.</div>`}
+    </div>
+
     <div class="sec-h"><span class="label">The voice</span></div>
     <div class="triptych">
       ${voiceCard('Transmit', `${v.transmit ? v.transmit.posts_wk : 0}/${v.transmit ? v.transmit.cadence : 3} posts`, v.transmit && v.transmit.status, v.transmit && v.transmit.findable ? 'Findable on Google' : 'Not findable yet', 'Did the voice go out?')}
@@ -170,7 +254,16 @@ async function viewPulse() {
     <div class="mini-panels" style="margin-top:var(--s5)">
       <div class="panel"><div class="mini-h">Needs you</div>${needsPanel(d.needs)}</div>
       <div class="panel"><div class="mini-h">Momentum · last 14 days</div>${sparkline(d.trend)}</div>
+      <div class="panel quiet-panel"><div class="mini-h">Gone quiet · 3+ days untouched</div>${quietBody(quiet)}</div>
+      ${attentionPanelHtml(attn)}
     </div>
+
+    <div class="panel rc-panel" style="margin-top:var(--s5)">
+      <div class="mini-h">Re-contact · scheduled energy coming due${rcUpcoming ? ` <span class="rc-up">+${rcUpcoming} upcoming</span>` : ''}</div>
+      ${rcDue.length ? `<div class="list">${rcDue.map((j) => recontactRow(j, true)).join('')}</div>`
+        : `<div class="needs-clear">Nothing due. Schedule a check-in from any job — that Volvo belt, the Impala exhaust — and it surfaces here when it's time.</div>`}
+    </div>
+
     <div class="sec-h"><span class="label">This week</span></div>
     <div class="panel goals-panel">
       ${goalBar('Leads', (v.hear ? v.hear.new_leads : 0) || 0, g.weekly_leads || 3)}
@@ -179,6 +272,10 @@ async function viewPulse() {
     </div>
   `)
   bindRows()
+  bindRecontact(app)
+  bindAttention(app)
+  const co = $('#closeout-btn'); if (co) co.onclick = openCloseout
+  const nl = $('#newlead'); if (nl) nl.onclick = openAddLead
   // Map the one-move to its guided gate playbook — these are deep walk-throughs, not flag-flips.
   const OM_GATE = { gbp: 'gbp', reviews: 'reviews', post: 'content' }
   const go = $('#om-go'); if (go) go.onclick = async () => {
@@ -193,28 +290,20 @@ async function viewPulse() {
   countUp($('#gscore'), e.score || 0)
   setTimeout(() => { const s = $('#gscore'); if (s) s.textContent = e.score || 0 }, 1100)
 }
-
-/* ---------------- TODAY ---------------- */
-async function viewToday() {
-  const d = await api('/api/today'); const s = d.stats || {}
-  const sec = (title, rows, empty) => rows && rows.length
-    ? `<div class="sec-h"><span class="label">${title}</span><span class="ct">${rows.length}</span></div><div class="list">${rows.map(leadRow).join('')}</div>`
-    : `<div class="sec-h"><span class="label">${title}</span></div><div class="lrow" style="color:var(--fg4);justify-content:center">${esc(empty)}</div>`
-  setView(`
-    <div class="kpis">
-      <div class="kpi primary"><div class="lab">Revenue</div><div class="val">${money(s.revenue)}</div><div class="meta">all-time</div></div>
-      <div class="kpi"><div class="lab">Paid jobs</div><div class="val">${s.paid_jobs || 0}</div><div class="meta">avg ${money(s.avg_ticket)}</div></div>
-      <div class="kpi"><div class="lab">Open</div><div class="val">${s.open_jobs || 0}</div><div class="meta">in pipeline</div></div>
-      <div class="kpi"><div class="lab">New leads</div><div class="val">${s.new_leads || 0}</div><div class="meta">waiting</div></div>
-    </div>
-    <div class="brief"><span class="tag">${I.spark} Briefing</span><p>${esc(d.brief || '')}</p></div>
-    ${sec('Call first', d.callFirst, 'No leads to call — turn on an activation gate.')}
-    ${d.scheduledToday && d.scheduledToday.length ? sec('Scheduled today', d.scheduledToday) : ''}
-    ${d.stale && d.stale.length ? sec('Going stale', d.stale) : ''}
-    ${d.unpaid && d.unpaid.length ? sec('Money owed', d.unpaid) : ''}
-  `)
-  bindRows()
+// inline body for the Gone-quiet panel (was the async quietSection used by the w2 wrapper)
+function quietBody(d) {
+  const items = (d && d.quiet) || []
+  if (!items.length) return `<div class="needs-clear">Nobody's gone quiet. Everyone's been touched in the last 3 days.</div>`
+  return `<div class="list">${items.map((j) => `
+    <div class="lrow" data-job="${j.id}">
+      <div class="grow"><div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
+        <div class="sub">${esc([j.vehicle, j.issue].filter(Boolean).join(' · ') || 'No detail')} · last touch ${j.last_touch ? ago(j.last_touch) + ' ago' : 'never'}</div></div>
+      <span class="pill ${j.status}"><span class="dot"></span>${esc((j.status || '').replace('_', ' '))}</span>
+      ${ageTag(j.quiet_days)}
+    </div>`).join('')}</div>`
 }
+
+/* leadRow — shared row renderer (Pulse "Who to touch now" ranked list) */
 function leadRow(j) {
   return `<div class="lrow" data-job="${j.id}">
     <div class="grow"><div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
@@ -225,21 +314,53 @@ function leadRow(j) {
 }
 function bindRows() { app.querySelectorAll('[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job))) }
 
-/* ---------------- PIPELINE ---------------- */
+/* ---------------- PIPELINE (absorbs Triage) ---------------- */
 const COLS = [['lead', 'Lead'], ['quoted', 'Quoted'], ['scheduled', 'Scheduled'], ['in_progress', 'In progress'], ['completed', 'Completed'], ['paid', 'Paid']]
+// 'board' = kanban (desktop default); 'money' = money-first ranked list (the old Triage, mobile default)
+let _pipeMode = (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width:768px)').matches) ? 'money' : 'board'
+// money-first sort: HIGH ticket_tier first, then safety, then recency
+function moneyFirstSort(jobs) {
+  return jobs.slice().sort((a, b) =>
+    (b.ticket_tier === 'HIGH') - (a.ticket_tier === 'HIGH') ||
+    (b.safety_flag ? 1 : 0) - (a.safety_flag ? 1 : 0) ||
+    new Date(b.created_at) - new Date(a.created_at))
+}
 async function viewPipeline() {
   const d = await api('/api/jobs'); const jobs = d.jobs || []
-  $('.topbar .right').innerHTML = `<button class="btn primary" id="addlead">${I.plus} Add lead</button>`
-  $('#addlead').onclick = openAddLead
-  setView(`<div class="board">${COLS.map(([k, label]) => {
-    const items = jobs.filter((j) => j.status === k)
-    const sum = items.reduce((a, j) => a + (Number(j.charge || j.est_value) || 0), 0)
-    return `<div class="col"><div class="col__h"><span class="dot" style="background:${STATUS_COLOR[k]}"></span>
-      <span class="ttl">${label}</span><span class="ct">${items.length}</span>${sum ? `<span class="sum">${money(sum)}</span>` : ''}</div>
-      <div class="col__b">${items.map(jobCard).join('') || '<div class="col__empty">—</div>'}</div></div>`
-  }).join('')}</div>`)
-  bindRows()
-  app.querySelectorAll('[data-adv]').forEach((b) => (b.onclick = async (e) => { e.stopPropagation(); await api(`/api/jobs/${b.dataset.adv}/advance`, { method: 'POST' }); renderApp('pipeline') }))
+  const open = jobs.filter((j) => j.status === 'lead' || j.status === 'quoted')
+  const tr = $('.topbar .right')
+  if (tr) tr.innerHTML = `<div class="seg pipe-mode">
+      <button class="${_pipeMode === 'board' ? 'on' : ''}" data-pipe-mode="board">${I.pipeline} Board</button>
+      <button class="${_pipeMode === 'money' ? 'on' : ''}" data-pipe-mode="money">${I.spark} Money first</button>
+    </div><button class="btn primary sm" id="addlead">${I.plus} Add lead</button>`
+  if (_pipeMode === 'money') {
+    const ranked = moneyFirstSort(open)
+    const s = { total: open.length, high: open.filter((j) => j.ticket_tier === 'HIGH').length, safety: open.filter((j) => j.safety_flag).length, uncontacted: open.filter((j) => !j.first_contact_at).length }
+    setView(`
+      <div class="kpis">
+        <div class="kpi primary"><div class="lab">Open leads</div><div class="val">${s.total}</div><div class="meta">to work</div></div>
+        <div class="kpi"><div class="lab">High-ticket</div><div class="val">${s.high}</div><div class="meta">work these first</div></div>
+        <div class="kpi ${s.safety ? 'warn' : ''}"><div class="lab">Safety</div><div class="val">${s.safety}</div><div class="meta">flagged urgent</div></div>
+        <div class="kpi ${s.uncontacted ? 'warn' : ''}"><div class="lab">Untouched</div><div class="val">${s.uncontacted}</div><div class="meta">no first contact</div></div>
+      </div>
+      <div class="sec-h"><span class="label">Open leads · money first</span><span class="ct">${ranked.length}</span></div>
+      ${ranked.length ? `<div class="list">${ranked.map(triageRow).join('')}</div>`
+        : emptyState('Queue is clear', 'No open leads waiting. When inbound comes in, the biggest jobs jump to the top here so your attention goes where the money is.')}
+    `)
+    bindTriage(ranked)
+  } else {
+    setView(`<div class="board">${COLS.map(([k, label]) => {
+      const items = jobs.filter((j) => j.status === k)
+      const sum = items.reduce((a, j) => a + (Number(j.charge || j.est_value) || 0), 0)
+      return `<div class="col"><div class="col__h"><span class="dot" style="background:${STATUS_COLOR[k]}"></span>
+        <span class="ttl">${label}</span><span class="ct">${items.length}</span>${sum ? `<span class="sum">${money(sum)}</span>` : ''}</div>
+        <div class="col__b">${items.map(jobCard).join('') || '<div class="col__empty">—</div>'}</div></div>`
+    }).join('')}</div>`)
+    bindRows()
+    app.querySelectorAll('[data-adv]').forEach((b) => (b.onclick = async (e) => { e.stopPropagation(); await api(`/api/jobs/${b.dataset.adv}/advance`, { method: 'POST' }); renderApp('pipeline') }))
+  }
+  app.querySelectorAll('[data-pipe-mode]').forEach((b) => (b.onclick = () => { _pipeMode = b.dataset.pipeMode; renderApp('pipeline') }))
+  const al = $('#addlead'); if (al) al.onclick = openAddLead
 }
 function jobCard(j) {
   const val = j.charge || j.est_value
@@ -253,9 +374,20 @@ function jobCard(j) {
   </div>`
 }
 
-/* ---------------- MONEY ---------------- */
-async function viewMoney() {
-  const d = await api('/api/money'); const t = d.targets || {}
+/* ---------------- NUMBERS (merged: The money + The reach) ---------------- */
+/* Was two tabs — Money (revenue/profit/targets/funnel) and Field (momentum/sources/
+   content-funnel/reputation). They answer the same question at two altitudes, so they're
+   one tab now: section 1 "The money", section 2 "The reach". Nothing real lost. */
+async function viewNumbers() {
+  const [d, src, mkt, mom, fun, rev] = await Promise.all([
+    api('/api/money').catch(() => ({})),
+    api('/api/sources').catch(() => ({ sources: [], totals: {} })),
+    api('/api/market').catch(() => ({ reputation: {}, recent_proof: [], market_notes: '' })),
+    api('/api/momentum').catch(() => ({ trend: [], summary: {} })),
+    api('/api/funnel').catch(() => ({ funnel: [], channels: [], totals: {}, honest: {} })),
+    api('/api/reviews').catch(() => ({ summary: {} })),
+  ])
+  const t = d.targets || {}
   const goal = t.target_revenue || 4800
   const pct = Math.min(100, Math.round(((d.revenue || 0) / goal) * 100))
   const fn = d.funnel || {}
@@ -263,7 +395,21 @@ async function viewMoney() {
     <div class="fbar"><i style="width:${Math.max(4, Math.round((val / (max || 1)) * 100))}%"></i></div>
     <span class="fval">${typeof val === 'number' && name === 'Revenue' ? money(val) : (val || 0)}</span></div>`
   const maxF = Math.max(fn.views || 0, fn.contacts || 0, fn.jobs || 0, 1)
+
+  const sources = src.sources || [], st = src.totals || {}, best = src.best
+  const rep = mkt.reputation || {}, recent = mkt.recent_proof || []
+  const mtrend = mom.trend || [], ms = mom.summary || {}
+  const lc = ms.label === 'Gaining' ? 'g' : ms.label === 'Bleeding' ? 'b' : 'w'
+  const dTxt = ms.delta == null ? 'first read' : (ms.delta > 0 ? `▲ ${ms.delta}` : ms.delta < 0 ? `▼ ${Math.abs(ms.delta)}` : 'flat')
+  const d30 = ms.delta_30d
+  const r = rev.summary || {}
+  const askRate = Math.round(Number((rep.ask_rate != null ? rep.ask_rate : r.ask_rate) || 0))
+  const gotRate = Math.round(Number((rep.got_rate != null ? rep.got_rate : r.got_rate) || 0))
+  const maxRev = Math.max(1, ...sources.map((s) => s.revenue || 0))
+
+  const tr = $('.topbar .right'); if (tr) tr.innerHTML = ''
   setView(`
+    <div class="sec-h"><span class="label">The money</span></div>
     <div class="kpis">
       <div class="kpi primary"><div class="lab">Revenue</div><div class="val">${money(d.revenue)}</div><div class="meta">all-time</div></div>
       <div class="kpi"><div class="lab">Profit</div><div class="val">${money(d.profit)}</div><div class="meta">charge − parts − gas</div></div>
@@ -281,7 +427,73 @@ async function viewMoney() {
       ${fstep('Revenue', fn.revenue || 0, goal, goal)}
     </div>
     <p style="color:var(--fg3);font-size:12px;margin-top:var(--s4)">Cheapest levers are close-rate &amp; ticket size — not traffic. To hit ${money(goal)} you need ~${Math.ceil(goal / (d.avg_ticket || 925))} jobs at the ${money(d.avg_ticket || 925)} avg.</p></div>
+
+    <div class="sec-h"><span class="label">The reach</span></div>
+    <div class="field-hero">
+      <div class="panel mom-card ${lc}">
+        ${momRing(ms.score || 0)}
+        <div class="mom-meta">
+          <div class="mom-label ${lc}">${esc(ms.label || 'Momentum')}</div>
+          <div class="mom-delta">${dTxt} vs yesterday${d30 != null ? ` · <span class="${d30 >= 0 ? 'up' : 'down'}">${d30 >= 0 ? '▲' : '▼'} ${Math.abs(d30)} in 30d</span>` : ''}</div>
+          <div class="mom-bd">${momChip('Acquire', (ms.breakdown || {}).acquisition)}${momChip('Convert', (ms.breakdown || {}).conversion)}${momChip('Trust', (ms.breakdown || {}).trust)}${momChip('Cash', (ms.breakdown || {}).cash)}</div>
+        </div>
+      </div>
+      <div class="panel mom-chart-panel">
+        <div class="mini-h">Energy · last 30 days</div>
+        ${momChart(mtrend)}
+      </div>
+    </div>
+
+    <div class="sec-h"><span class="label">Where the leads come from</span>${best ? `<span class="ct">best · ${esc(best.source || best)}</span>` : ''}</div>
+    ${sources.length ? `
+      <div class="panel src-totals">
+        <div class="src-tot"><div class="k">Leads</div><div class="v num">${st.leads || st.total || 0}</div></div>
+        <div class="src-tot"><div class="k">Paid</div><div class="v num">${st.paid || 0}</div></div>
+        <div class="src-tot"><div class="k">Revenue</div><div class="v num" style="color:var(--green)">${money(st.revenue)}</div></div>
+        <div class="src-tot"><div class="k">Conversion</div><div class="v num">${Math.round(Number(st.conversion || 0))}%</div></div>
+      </div>
+      <div class="src-table">
+        <div class="src-row src-head">
+          <span class="src-name">Source</span><span>Leads</span><span>Paid</span><span>Conv.</span><span>Avg</span><span class="src-rev">Revenue</span>
+        </div>
+        ${sources.map((s) => srcRow(s, maxRev, best)).join('')}
+      </div>`
+      : emptyState('No sources to read yet', 'As leads come in tagged by where they came from — website, the AI widget, referrals, phone — this breaks down which funnel actually turns into paid jobs.')}
+
+    ${contentFunnelSection(fun)}
+
+    <div class="sec-h"><span class="label">Reputation</span><span class="ct">${rep.proof_count || 0} on the wall</span></div>
+    <div class="kpis">
+      <div class="kpi primary"><div class="lab">Reviews</div><div class="val">${rep.reviews_count || 0}${rep.reviews_target ? ` <span style="font-size:12px;color:var(--fg4)">/ ${rep.reviews_target}</span>` : ''}</div><div class="meta">${rep.gbp_claimed ? 'Google profile claimed' : 'claim your Google profile'}</div></div>
+      <div class="kpi ${askRate < 80 && (rep.eligible || r.eligible) ? 'warn' : ''}"><div class="lab">Ask rate</div><div class="val">${askRate}%</div><div class="meta">${rep.asked || r.asked || 0} of ${rep.eligible || r.eligible || 0} asked</div></div>
+      <div class="kpi"><div class="lab">Got rate</div><div class="val">${gotRate}%</div><div class="meta">${rep.received || r.received || 0} landed</div></div>
+      <div class="kpi"><div class="lab">Proof pieces</div><div class="val">${rep.proof_count || 0}</div><div class="meta">ready to send</div></div>
+    </div>
+    <div class="field-split">
+      <div class="panel">
+        <div class="mini-h">Recent proof</div>
+        ${recent.length ? `<div class="list">${recent.map(fieldProofRow).join('')}</div>`
+          : `<div class="needs-clear">Nothing on the wall yet. Ask every happy customer, then log what they say in Proof — it surfaces here.</div>`}
+        <button class="btn ghost sm" id="field-proof" style="margin-top:var(--s3)">${I.arrow} Go to Proof wall</button>
+      </div>
+      <div class="panel">
+        <div class="mini-h">Market notes · what the local shops are doing</div>
+        <p style="color:var(--fg3);font-size:12px;margin:calc(-1 * var(--s2)) 0 var(--s3)">Awareness, not scraping. Jot what shops near you charge or post — so you price and pitch with eyes open. Trust over price, always.</p>
+        <textarea class="input ta" id="mkt-notes" rows="7" placeholder="e.g. Local euro shop quoting ~$2,400 on N20 timing chains · Brampton mobile guy posting brake jobs at $280 (cheap, attracts hagglers) · dealer wait times 2+ wks">${esc(mkt.market_notes || '')}</textarea>
+        <div class="mkt-foot"><span class="mkt-saved" id="mkt-saved"></span><button class="btn primary sm" id="mkt-save">${I.check} Save notes</button></div>
+      </div>
+    </div>
   `)
+  app.querySelectorAll('.field-proof-row[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
+  const gs = $('#field-studio'); if (gs) gs.onclick = () => renderApp('content')
+  const gp = $('#field-proof'); if (gp) gp.onclick = () => renderApp('proof')
+  const save = $('#mkt-save'); if (save) save.onclick = async () => {
+    save.disabled = true
+    await api('/api/market', { method: 'PUT', body: JSON.stringify({ notes: $('#mkt-notes').value }) })
+    save.disabled = false
+    const tag = $('#mkt-saved'); if (tag) { tag.textContent = 'Saved'; tag.classList.add('on'); setTimeout(() => { tag.textContent = ''; tag.classList.remove('on') }, 1600) }
+  }
+  setTimeout(() => { const ring = $('#mring'); if (ring) ring.style.strokeDashoffset = ring.dataset.target }, 50)
 }
 
 /* ---------------- ACTIVATION (guided gates) ---------------- */
@@ -338,14 +550,18 @@ async function openJob(id) {
       <div style="display:flex;gap:var(--s2);flex-wrap:wrap">${tierBadge(j)}${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}
         ${j.charge || j.est_value ? `<span class="pill" style="color:var(--fg);background:var(--bg4)">${money(j.charge || j.est_value)}</span>` : ''}</div>
       <div style="color:var(--fg2);font-size:13px">${esc(j.issue || 'No detail')}</div>
-      <div style="display:flex;gap:var(--s2);flex-wrap:wrap">
-        ${j.phone ? `<a class="btn ghost sm" href="tel:${esc(j.phone)}">${I.phone} Call</a>` : ''}
-        ${j.status !== 'paid' && j.status !== 'lost' ? `<button class="btn ghost sm" id="dadv">${I.arrow} Advance</button>` : ''}
-        <button class="btn ghost sm" id="dreply">Quick reply</button>
-        <button class="btn ghost sm" id="drecontact">${I.plus} Check-in</button>
-        ${j.status === 'lead' || j.status === 'quoted' ? `<button class="btn primary sm" id="dwon">${I.check} Mark won</button>` : ''}
-        <button class="btn ghost sm" id="dsched">${I.today} ${j.scheduled_date ? 'Reschedule' : 'Schedule'}</button>
-        <button class="btn ghost sm" id="dquote">Quote</button></div>
+      <div class="drawer-acts">
+        ${jobPrimaryAction(j)}
+        <button class="btn ghost sm" id="dmore">${I.more} More</button>
+        <div class="drawer-more" id="dmore-panel" hidden>
+          ${j.phone ? `<a class="btn ghost sm" href="tel:${esc(j.phone)}">${I.phone} Call</a>` : ''}
+          ${j.status !== 'paid' && j.status !== 'lost' ? `<button class="btn ghost sm" id="dadv">${I.arrow} Advance</button>` : ''}
+          <button class="btn ghost sm" id="dreply">Quick reply</button>
+          <button class="btn ghost sm" id="drecontact">${I.plus} Check-in</button>
+          ${j.status === 'lead' || j.status === 'quoted' ? `<button class="btn ghost sm" id="dwon">${I.check} Mark won</button>` : ''}
+          <button class="btn ghost sm" id="dsched">${I.today} ${j.scheduled_date ? 'Reschedule' : 'Schedule'}</button>
+          <button class="btn ghost sm" id="dquote">Quote</button>
+        </div></div>
       <div><div class="label" style="margin-bottom:var(--s2)">Files &amp; photos</div><div class="asset-host">Loading…</div></div>
       <div><div class="label" style="margin-bottom:var(--s2)">Activity</div>
         <div class="tl">${(d.activity || []).map((a) => `<div class="tl__i"><span class="dot"></span><div><div class="body">${esc(a.body || a.type)}</div><div class="when">${ago(a.created_at)} ago</div></div></div>`).join('') || '<span style="color:var(--fg4);font-size:12px">No activity yet</span>'}</div></div>
@@ -353,17 +569,38 @@ async function openJob(id) {
   document.body.appendChild(wrap)
   const close = () => wrap.remove()
   $('.scrim', wrap).onclick = close; $('.drawer__close', wrap).onclick = close
-  const adv = $('#dadv', wrap); if (adv) adv.onclick = async () => { await api(`/api/jobs/${id}/advance`, { method: 'POST' }); close(); renderApp() }
+  const doAdvance = async () => { await api(`/api/jobs/${id}/advance`, { method: 'POST' }); close(); renderApp() }
+  const doWon = async (btn) => { if (btn) btn.disabled = true; const res = await api(`/api/jobs/${id}/won`, { method: 'POST' }); close(); showWonChecklist(res, j.customer); renderApp() }
+  // the ONE primary action for this job's stage (mirrors the Pulse one-move philosophy)
+  const prim = $('#dprimary', wrap); if (prim) prim.onclick = () => {
+    const a = prim.dataset.prim
+    if (a === 'quote') { close(); openQuote(j) }
+    else if (a === 'won') doWon(prim)
+    else doAdvance()
+  }
+  // "More" overflow holds the rest
+  const more = $('#dmore', wrap), panel = $('#dmore-panel', wrap)
+  if (more && panel) more.onclick = () => { panel.hidden = !panel.hidden; more.classList.toggle('on', !panel.hidden) }
+  const adv = $('#dadv', wrap); if (adv) adv.onclick = doAdvance
   $('#dquote', wrap).onclick = () => { close(); openQuote(j) }
   const dsc = $('#dsched', wrap); if (dsc) dsc.onclick = () => { close(); openSchedule(j) }
   const dr = $('#dreply', wrap); if (dr) dr.onclick = () => openQuickReply(j)
   const rc = $('#drecontact', wrap); if (rc) rc.onclick = () => openRecontact(j)
-  const won = $('#dwon', wrap); if (won) won.onclick = async () => {
-    won.disabled = true
-    const res = await api(`/api/jobs/${id}/won`, { method: 'POST' })
-    close(); showWonChecklist(res, j.customer); renderApp()
-  }
+  const won = $('#dwon', wrap); if (won) won.onclick = () => doWon(won)
   const ah = $('.asset-host', wrap); if (ah) loadAssets(id, ah)
+}
+// The single status-keyed primary action button for the job drawer.
+function jobPrimaryAction(j) {
+  const map = {
+    lead: ['quote', 'Reply + Quote', I.bolt],
+    quoted: ['won', 'Mark won', I.check],
+    scheduled: ['advance', 'Mark done', I.check],
+    in_progress: ['advance', 'Mark done', I.check],
+    completed: ['advance', 'Collect / Paid', I.money],
+  }
+  const a = map[j.status]
+  if (!a) return '' // paid / lost — no next action
+  return `<button class="btn primary sm dprimary" id="dprimary" data-prim="${a[0]}">${a[2]} ${esc(a[1])}</button>`
 }
 
 /* ---------------- QUOTE MODAL ($1k profit floor) ---------------- */
@@ -426,8 +663,7 @@ function openAddLead() {
 /* ---------------- boot ---------------- */
 /* ===================== WAVE 2 · STOP THE LEAKS ===================== */
 
-/* --- shared quote/age helpers --- */
-const QUOTE_PILL = { draft: 'lead', sent: 'quoted', accepted: 'scheduled', declined: 'lost' }
+/* --- shared quote/age helpers (pill classes come from the canonical PILL map) --- */
 const QUOTE_LABEL = { draft: 'Draft', sent: 'Sent', accepted: 'Accepted', declined: 'Declined' }
 function ageTag(days) {
   const d = Math.max(0, Math.round(Number(days || 0)))
@@ -439,48 +675,8 @@ function profitTag(profit, below) {
   return `<span class="profit-tag ${below ? 'bad' : 'ok'}">${money(profit)} profit</span>`
 }
 
-/* --- reusable Gone-quiet section (used on Pulse + standalone) --- */
-async function quietSection() {
-  let d
-  try { d = await api('/api/quiet') } catch (e) { return '' }
-  const items = d.quiet || []
-  if (!items.length) return `<div class="needs-clear">Nobody's gone quiet. Everyone's been touched in the last 3 days.</div>`
-  return `<div class="list">${items.map((j) => `
-    <div class="lrow" data-job="${j.id}">
-      <div class="grow"><div class="nm">${esc(j.customer || 'Unknown')} ${j.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
-        <div class="sub">${esc([j.vehicle, j.issue].filter(Boolean).join(' · ') || 'No detail')} · last touch ${j.last_touch ? ago(j.last_touch) + ' ago' : 'never'}</div></div>
-      <span class="pill ${j.status}"><span class="dot"></span>${esc((j.status || '').replace('_', ' '))}</span>
-      ${ageTag(j.quiet_days)}
-    </div>`).join('')}</div>`
-}
-
-/* Inject the Gone-quiet panel + Close-out button into the Pulse after it renders.
-   Additive: we wrap renderApp so existing pulse code is untouched. */
-const _renderApp_w2 = renderApp
-renderApp = async function (next) {
-  await _renderApp_w2(next)
-  if (tab !== 'pulse') return
-  const tr = $('.topbar .right')
-  if (tr && !$('#closeout-btn', tr)) {
-    const btn = document.createElement('button')
-    btn.className = 'btn ghost sm'; btn.id = 'closeout-btn'; btn.innerHTML = `${I.check} Close out`
-    btn.onclick = openCloseout
-    tr.appendChild(btn)
-  }
-  const mp = $('.mini-panels')
-  if (mp && !$('.quiet-panel')) {
-    const panel = document.createElement('div')
-    panel.className = 'panel quiet-panel'
-    panel.innerHTML = `<div class="mini-h">Gone quiet · 3+ days untouched</div><div class="quiet-body">Loading…</div>`
-    mp.appendChild(panel)
-    panel.querySelector('.quiet-body').innerHTML = await quietSection()
-    panel.querySelectorAll('[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
-  }
-  if (mp && !$('.attn-panel')) {
-    const ap = document.createElement('div'); ap.innerHTML = await attentionPanel()
-    if (ap.firstElementChild) { mp.appendChild(ap.firstElementChild); bindAttention(mp) }
-  }
-}
+/* Gone-quiet, Re-contact, and Attention now render inline inside viewPulse() — no
+   renderApp monkey-patching. quietBody()/attentionPanelHtml() live near viewPulse. */
 
 /* ===================== QUOTES ===================== */
 async function viewQuotes() {
@@ -512,7 +708,7 @@ function quoteRow(q) {
       <div class="nm">${esc(q.customer || 'Unknown')} ${q.safety_flag ? '<span class="safety">SAFETY</span>' : ''}</div>
       <div class="sub">${esc([q.vehicle, q.issue || q.service].filter(Boolean).join(' · ') || 'No detail')}</div>
       <div class="qmeta">
-        <span class="pill ${QUOTE_PILL[st]}"><span class="dot"></span>${QUOTE_LABEL[st]}</span>
+        <span class="pill ${PILL[st] || 'lead'}"><span class="dot"></span>${QUOTE_LABEL[st]}</span>
         ${profitTag(q.profit != null ? q.profit : profit, q.below_floor != null ? q.below_floor : (q.profit != null ? q.profit : profit) < 1000)}
         ${st === 'sent' || st === 'accepted' || st === 'declined' ? ageTag(q.age_days) : ''}
       </div>
@@ -645,10 +841,9 @@ const ATTENTION_ROWS = [
   ['completed_unpaid', 'Job done, unpaid', 'Money on the table'],
   ['new_lead', 'Any new lead', 'Every inbound — off by default, lives in the brief'],
 ]
-async function viewBackburnerSettings() { /* reserved */ }
-async function attentionPanel() {
-  let d
-  try { d = await api('/api/attention') } catch (e) { return '' }
+// Synchronous panel body from already-fetched data — rendered inline on Pulse + on its own tab.
+function attentionPanelHtml(d) {
+  d = d || {}
   return `<div class="panel attn-panel">
     <div class="mini-h">Attention guard</div>
     <p style="color:var(--fg3);font-size:12px;margin:calc(-1 * var(--s2)) 0 var(--s3)">What's worth interrupting you for vs. what waits for the daily brief. No pushes wired up yet — this just sets the rule.</p>
@@ -658,6 +853,17 @@ async function attentionPanel() {
         <button class="toggle ${d[k] ? 'on' : ''}" data-attn="${k}"><span class="knob"></span></button>
       </div>`).join('')}
   </div>`
+}
+// Standalone Brief-settings tab (overflow menu) — the same panel on its own page.
+async function viewAttention() {
+  const d = await api('/api/attention').catch(() => ({}))
+  const tr = $('.topbar .right'); if (tr) tr.innerHTML = ''
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} What's worth a buzz</span>
+      <p>Set what interrupts you vs. what waits for the daily brief. No pushes are wired up yet — this just records the rule so the brief knows what matters.</p></div>
+    <div class="mini-panels"><div style="grid-column:1 / -1">${attentionPanelHtml(d)}</div></div>
+  `)
+  bindAttention(app)
 }
 function bindAttention(scope) {
   (scope || app).querySelectorAll('[data-attn]').forEach((b) => (b.onclick = async () => {
@@ -772,23 +978,9 @@ async function openQuickReply(j) {
   }
 }
 
-/* ===================== TRIAGE ===================== */
-async function viewTriage() {
-  const d = await api('/api/triage'); const items = d.triage || []; const s = d.summary || {}
-  const tr = $('.topbar .right'); if (tr) { tr.innerHTML = `<button class="btn primary" id="addlead">${I.plus} Add lead</button>`; $('#addlead').onclick = openAddLead }
-  setView(`
-    <div class="kpis">
-      <div class="kpi primary"><div class="lab">Open leads</div><div class="val">${s.total || 0}</div><div class="meta">to triage</div></div>
-      <div class="kpi"><div class="lab">High-ticket</div><div class="val">${s.high || 0}</div><div class="meta">work these first</div></div>
-      <div class="kpi ${s.safety ? 'warn' : ''}"><div class="lab">Safety</div><div class="val">${s.safety || 0}</div><div class="meta">flagged urgent</div></div>
-      <div class="kpi ${s.uncontacted ? 'warn' : ''}"><div class="lab">Untouched</div><div class="val">${s.uncontacted || 0}</div><div class="meta">no first contact</div></div>
-    </div>
-    <div class="sec-h"><span class="label">Triage queue · money first</span><span class="ct">${items.length}</span></div>
-    ${items.length ? `<div class="list">${items.map(triageRow).join('')}</div>`
-      : emptyState('Queue is clear', 'No open leads waiting. When inbound comes in, the biggest jobs jump to the top here so your attention goes where the money is.')}
-  `)
-  bindTriage(items)
-}
+/* ===================== TRIAGE (folded into Pipeline's money-first mode) ===================== */
+/* viewTriage removed — Pipeline's "Money first" toggle is the triage queue now.
+   triageRow + bindTriage stay; they render that ranked list. */
 function triageRow(j) {
   const val = j.charge || j.est_value
   const uncontacted = !j.first_contact_at
@@ -1041,8 +1233,6 @@ function openProof() {
    content_edit handoff carrying the source clips' R2 keys + the brief — that's
    the Claude-Code editing bridge. Free AI drafts captions via the crm-api Worker.
    The legacy lead-attribution lives on inside the card drawer (the stepper). */
-const CONTENT_STATUS = [['idea', 'Idea'], ['draft', 'Draft'], ['scheduled', 'Scheduled'], ['posted', 'Posted']]
-const CONTENT_PILL = { idea: 'lead', draft: 'lead', scheduled: 'quoted', posted: 'completed' }
 const STUDIO_COLS = [
   ['idea', 'Idea', 'var(--fg4)'],
   ['raw', 'Raw', 'var(--ai)'],
@@ -1052,7 +1242,7 @@ const STUDIO_COLS = [
   ['posted', 'Posted', 'var(--accent)'],
 ]
 const STAGE_LABEL = { idea: 'Idea', raw: 'Raw', editing: 'Editing', ready: 'Ready', scheduled: 'Scheduled', posted: 'Posted' }
-const STAGE_PILL = { idea: 'lead', raw: 'lead', editing: 'in_progress', ready: 'completed', scheduled: 'scheduled', posted: 'completed' }
+// pill classes for content stages come from the canonical PILL map
 // the channel a card is tagged with → a short chip color cue (purely cosmetic)
 const CHANNELS = [['instagram', 'Instagram'], ['tiktok', 'TikTok'], ['youtube', 'YouTube'], ['gbp', 'Google'], ['reel', 'Reel'], ['facebook', 'Facebook']]
 let _pipelineData = null   // cached so card clicks reopen the drawer without a refetch
@@ -1240,7 +1430,7 @@ async function openPieceDrawer(id) {
   const hashtags = Array.isArray(p.hashtags) ? p.hashtags : []
   const wrap = document.createElement('div')
   wrap.innerHTML = `<div class="scrim"></div><aside class="drawer st-drawer">
-    <div class="drawer__h"><span class="pill ${STAGE_PILL[stage] || 'lead'}"><span class="dot"></span>${esc(STAGE_LABEL[stage] || stage)}</span>
+    <div class="drawer__h"><span class="pill ${PILL[stage] || 'lead'}"><span class="dot"></span>${esc(STAGE_LABEL[stage] || stage)}</span>
       ${p.channel ? `<span class="age-tag">${esc(channelLabel(p.channel))}</span>` : ''}
       <button class="drawer__close">${I.x}</button></div>
     <div class="drawer__b">
@@ -1572,52 +1762,8 @@ async function openSourcePicker(contentId, onDone) {
   }
 }
 
-/* ===================== ASSETS LIBRARY ===================== */
-const LIB_KINDS = [['', 'All'], ['photo', 'Photos'], ['clip', 'Clips'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['doc', 'Docs']]
-let _libFilter = { kind: '', is_before: '' }
-async function viewAssets() {
-  const tr = $('.topbar .right'); if (tr) tr.innerHTML = ''
-  setView(`<div id="lib-wrap"><div class="loading">Loading…</div></div>`)
-  await loadLibrary()
-}
-async function loadLibrary() {
-  const qs = []
-  if (_libFilter.kind) qs.push('kind=' + encodeURIComponent(_libFilter.kind))
-  if (_libFilter.is_before) qs.push('is_before=' + encodeURIComponent(_libFilter.is_before))
-  const d = await api('/api/assets' + (qs.length ? '?' + qs.join('&') : ''))
-  const assets = d.assets || [], byKind = d.by_kind || {}
-  const host = $('#lib-wrap'); if (!host) return
-  const chips = LIB_KINDS.map(([v, l]) => `<button class="lib-chip ${_libFilter.kind === v ? 'on' : ''}" data-lib-kind="${v}">${l}${v && byKind[v] ? ` <b>${byKind[v]}</b>` : ''}</button>`).join('')
-  host.innerHTML = `
-    <div class="brief"><span class="tag">${I.bolt} Every job, one shelf</span>
-      <p>All the photos and clips off your jobs, pulled out of your camera roll and tied to who and what they're from. Reuse them for content and to close — the before/after that sells the next big one.</p></div>
-    <div class="lib-bar">
-      <div class="lib-chips">${chips}</div>
-      <button class="lib-chip before ${_libFilter.is_before === 'true' ? 'on' : ''}" data-lib-before>${I.spark} Before shots</button>
-    </div>
-    ${assets.length
-      ? `<div class="sec-h"><span class="label">${_libFilter.kind ? (LIB_KINDS.find((k) => k[0] === _libFilter.kind) || [, 'Assets'])[1] : 'All assets'}${_libFilter.is_before === 'true' ? ' · before' : ''}</span><span class="ct">${d.total || assets.length}</span></div>
-        <div class="lib-grid">${assets.map(libTile).join('')}</div>`
-      : emptyState('Nothing here yet', 'Attach photos and clips from the job drawer — they all flow into this shelf, organized and ready to reuse for content or to show the next customer.')}
-  `
-  host.querySelectorAll('[data-lib-kind]').forEach((b) => (b.onclick = () => { _libFilter.kind = b.dataset.libKind; loadLibrary() }))
-  const bf = host.querySelector('[data-lib-before]'); if (bf) bf.onclick = () => { _libFilter.is_before = _libFilter.is_before === 'true' ? '' : 'true'; loadLibrary() }
-  host.querySelectorAll('[data-lib-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.libJob)))
-}
-function libTile(a) {
-  const isImg = a.kind === 'photo'
-  return `<div class="lib-tile">
-    <div class="lib-tile__media ${isImg ? '' : 'doc'}" ${a.job_id ? `data-lib-job="${a.job_id}"` : ''}>
-      ${isImg ? `<img src="${esc(a.url)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('broken')">` : `<span class="lib-kind">${esc((a.kind || 'doc').toUpperCase())}</span>`}
-      ${a.is_before ? '<span class="lib-before">BEFORE</span>' : ''}
-      <a class="lib-open" href="${esc(a.url)}" target="_blank" rel="noopener" title="Open">${I.arrow}</a>
-    </div>
-    <div class="lib-tile__meta" ${a.job_id ? `data-lib-job="${a.job_id}"` : ''}>
-      <div class="lib-tile__lbl">${esc(a.label || a.kind || 'attachment')}</div>
-      <div class="lib-tile__sub">${esc([a.customer, a.vehicle].filter(Boolean).join(' · ') || (a.issue || a.service || ''))}</div>
-    </div>
-  </div>`
-}
+/* Old Assets Library removed — fully replaced by the Vault (viewVault). The libTile
+   grid styles (.lib-*) are reused by the Vault. */
 
 /* ===================== RE-CONTACT ===================== */
 function recontactRow(j, overdue) {
@@ -1700,27 +1846,7 @@ function showWonChecklist(res, customer) {
   wrap.querySelectorAll('.mclose').forEach((b) => (b.onclick = close))
 }
 
-/* Inject the Re-contact "due now" panel into the Pulse (additive wrap, like Wave 2). */
-const _renderApp_w4 = renderApp
-renderApp = async function (next) {
-  await _renderApp_w4(next)
-  if (tab !== 'pulse') return
-  const mp = $('.mini-panels')
-  if (mp && !$('.rc-panel')) {
-    let d; try { d = await api('/api/recontact') } catch (e) { d = null }
-    const due = d && d.due ? d.due : []
-    const upcoming = d && d.count ? (d.count.upcoming || 0) : 0
-    const panel = document.createElement('div')
-    panel.className = 'panel rc-panel'
-    panel.style.gridColumn = '1 / -1'
-    panel.innerHTML = `<div class="mini-h">Re-contact · scheduled energy coming due${upcoming ? ` <span class="rc-up">+${upcoming} upcoming</span>` : ''}</div>
-      ${due.length ? `<div class="list">${due.map((j) => recontactRow(j, true)).join('')}</div>`
-        : `<div class="needs-clear">Nothing due. Schedule a check-in from any job — that Volvo belt, the Impala exhaust — and it surfaces here when it's time.</div>`}`
-    mp.appendChild(panel)
-    bindRecontact(panel)
-  }
-}
-
+/* The Re-contact "due now" panel renders inline inside viewPulse() — no renderApp wrap. */
 
 /* ===================== WAVE 5 · SEE THE FIELD ===================== */
 
@@ -1921,93 +2047,8 @@ function openSchedule(j) {
   const cl = $('#sc-clear', wrap); if (cl) cl.onclick = () => save(true)
 }
 
-/* ===================== FIELD (sources + reputation + momentum) ===================== */
-async function viewField() {
-  const [src, mkt, mom, fun] = await Promise.all([
-    api('/api/sources').catch(() => ({ sources: [], totals: {} })),
-    api('/api/market').catch(() => ({ reputation: {}, recent_proof: [], market_notes: '' })),
-    api('/api/momentum').catch(() => ({ trend: [], summary: {} })),
-    api('/api/funnel').catch(() => ({ funnel: [], channels: [], totals: {}, honest: {} })),
-  ])
-  const sources = src.sources || [], st = src.totals || {}, best = src.best
-  const rep = mkt.reputation || {}, recent = mkt.recent_proof || []
-  const mtrend = mom.trend || [], ms = mom.summary || {}
-  const tr = $('.topbar .right'); if (tr) tr.innerHTML = ''
-  const lc = ms.label === 'Gaining' ? 'g' : ms.label === 'Bleeding' ? 'b' : 'w'
-  const dTxt = ms.delta == null ? 'first read' : (ms.delta > 0 ? `▲ ${ms.delta}` : ms.delta < 0 ? `▼ ${Math.abs(ms.delta)}` : 'flat')
-  const d30 = ms.delta_30d
-  const askRate = Math.round(Number(rep.ask_rate || 0)), gotRate = Math.round(Number(rep.got_rate || 0))
-  const maxRev = Math.max(1, ...sources.map((s) => s.revenue || 0))
-  setView(`
-    <div class="brief"><span class="tag">${I.bolt} The field — where it comes from, what they say</span>
-      <p>Stop spreading energy evenly. This shows which funnel actually produces, what your reputation looks like, and whether your momentum's climbing or bleeding. Pour into what works.</p></div>
-
-    <div class="field-hero">
-      <div class="panel mom-card ${lc}">
-        ${momRing(ms.score || 0)}
-        <div class="mom-meta">
-          <div class="mom-label ${lc}">${esc(ms.label || 'Momentum')}</div>
-          <div class="mom-delta">${dTxt} vs yesterday${d30 != null ? ` · <span class="${d30 >= 0 ? 'up' : 'down'}">${d30 >= 0 ? '▲' : '▼'} ${Math.abs(d30)} in 30d</span>` : ''}</div>
-          <div class="mom-bd">${momChip('Acquire', (ms.breakdown || {}).acquisition)}${momChip('Convert', (ms.breakdown || {}).conversion)}${momChip('Trust', (ms.breakdown || {}).trust)}${momChip('Cash', (ms.breakdown || {}).cash)}</div>
-        </div>
-      </div>
-      <div class="panel mom-chart-panel">
-        <div class="mini-h">Energy · last 30 days</div>
-        ${momChart(mtrend)}
-      </div>
-    </div>
-
-    <div class="sec-h"><span class="label">Where the leads come from</span>${best ? `<span class="ct">best · ${esc(best.source || best)}</span>` : ''}</div>
-    ${sources.length ? `
-      <div class="panel src-totals">
-        <div class="src-tot"><div class="k">Leads</div><div class="v num">${st.leads || st.total || 0}</div></div>
-        <div class="src-tot"><div class="k">Paid</div><div class="v num">${st.paid || 0}</div></div>
-        <div class="src-tot"><div class="k">Revenue</div><div class="v num" style="color:var(--green)">${money(st.revenue)}</div></div>
-        <div class="src-tot"><div class="k">Conversion</div><div class="v num">${Math.round(Number(st.conversion || 0))}%</div></div>
-      </div>
-      <div class="src-table">
-        <div class="src-row src-head">
-          <span class="src-name">Source</span><span>Leads</span><span>Paid</span><span>Conv.</span><span>Avg</span><span class="src-rev">Revenue</span>
-        </div>
-        ${sources.map((s) => srcRow(s, maxRev, best)).join('')}
-      </div>`
-      : emptyState('No sources to read yet', 'As leads come in tagged by where they came from — website, the AI widget, referrals, phone — this breaks down which funnel actually turns into paid jobs.')}
-
-    ${contentFunnelSection(fun)}
-
-    <div class="sec-h"><span class="label">Reputation</span><span class="ct">${rep.proof_count || 0} on the wall</span></div>
-    <div class="kpis">
-      <div class="kpi primary"><div class="lab">Reviews</div><div class="val">${rep.reviews_count || 0}${rep.reviews_target ? ` <span style="font-size:12px;color:var(--fg4)">/ ${rep.reviews_target}</span>` : ''}</div><div class="meta">${rep.gbp_claimed ? 'Google profile claimed' : 'claim your Google profile'}</div></div>
-      <div class="kpi ${askRate < 80 && rep.eligible ? 'warn' : ''}"><div class="lab">Ask rate</div><div class="val">${askRate}%</div><div class="meta">${rep.asked || 0} of ${rep.eligible || 0} asked</div></div>
-      <div class="kpi"><div class="lab">Got rate</div><div class="val">${gotRate}%</div><div class="meta">${rep.received || 0} landed</div></div>
-      <div class="kpi"><div class="lab">Proof pieces</div><div class="val">${rep.proof_count || 0}</div><div class="meta">ready to send</div></div>
-    </div>
-    <div class="field-split">
-      <div class="panel">
-        <div class="mini-h">Recent proof</div>
-        ${recent.length ? `<div class="list">${recent.map(fieldProofRow).join('')}</div>`
-          : `<div class="needs-clear">Nothing on the wall yet. Ask every happy customer, then log what they say in Proof — it surfaces here.</div>`}
-        <button class="btn ghost sm" id="field-proof" style="margin-top:var(--s3)">${I.arrow} Go to Proof wall</button>
-      </div>
-      <div class="panel">
-        <div class="mini-h">Market notes · what the local shops are doing</div>
-        <p style="color:var(--fg3);font-size:12px;margin:calc(-1 * var(--s2)) 0 var(--s3)">Awareness, not scraping. Jot what shops near you charge or post — so you price and pitch with eyes open. Trust over price, always.</p>
-        <textarea class="input ta" id="mkt-notes" rows="7" placeholder="e.g. Local euro shop quoting ~$2,400 on N20 timing chains · Brampton mobile guy posting brake jobs at $280 (cheap, attracts hagglers) · dealer wait times 2+ wks">${esc(mkt.market_notes || '')}</textarea>
-        <div class="mkt-foot"><span class="mkt-saved" id="mkt-saved"></span><button class="btn primary sm" id="mkt-save">${I.check} Save notes</button></div>
-      </div>
-    </div>
-  `)
-  app.querySelectorAll('.field-proof-row[data-job]').forEach((el) => (el.onclick = () => openJob(el.dataset.job)))
-  const gs = $('#field-studio'); if (gs) gs.onclick = () => renderApp('content')
-  const gp = $('#field-proof'); if (gp) gp.onclick = () => renderApp('proof')
-  const save = $('#mkt-save'); if (save) save.onclick = async () => {
-    save.disabled = true
-    await api('/api/market', { method: 'PUT', body: JSON.stringify({ notes: $('#mkt-notes').value }) })
-    save.disabled = false
-    const tag = $('#mkt-saved'); if (tag) { tag.textContent = 'Saved'; tag.classList.add('on'); setTimeout(() => { tag.textContent = ''; tag.classList.remove('on') }, 1600) }
-  }
-  setTimeout(() => { const r = $('#mring'); if (r) r.style.strokeDashoffset = r.dataset.target }, 50)
-}
+/* viewField merged into viewNumbers ("The reach" section). Its components — momRing,
+   momChip, momChart, srcRow, srcLabel, fieldProofRow, contentFunnelSection — live on below. */
 function momRing(score) {
   const r = 42, circ = 2 * Math.PI * r, off = circ * (1 - Math.max(0, Math.min(100, score)) / 100)
   const col = score >= 66 ? '#44D07F' : score >= 33 ? '#E0922E' : '#F6736B'
@@ -2117,8 +2158,6 @@ function cfChannelRow(ch, channels, t) {
    links, and "Hand to Claude Code" buttons. Finishing every step trips the gate
    done + points you at the next move. Shared by Activation + the Pulse one-move. */
 
-const PLAYBOOK_PILL = { todo: 'lead', doing: 'in_progress', done: 'completed' }
-
 async function openPlaybook(key, opts = {}) {
   let d
   try { d = await api(`/api/playbook/${encodeURIComponent(key)}`) }
@@ -2129,7 +2168,7 @@ async function openPlaybook(key, opts = {}) {
   const wrap = document.createElement('div')
   wrap.innerHTML = `<div class="scrim"></div><aside class="drawer pb-drawer">
     <div class="drawer__h">
-      <span class="pill ${PLAYBOOK_PILL[(d.gate || {}).status] || 'lead'}"><span class="dot"></span>${esc(((d.gate || {}).status || 'todo').replace('_', ' '))}</span>
+      <span class="pill ${PILL[(d.gate || {}).status] || 'lead'}"><span class="dot"></span>${esc(((d.gate || {}).status || 'todo').replace('_', ' '))}</span>
       <div class="pb-htitle">${esc((d.gate || {}).label || 'Playbook')}</div>
       <button class="drawer__close">${I.x}</button>
     </div>
@@ -2218,7 +2257,7 @@ function playbookStep(s, i, done) {
 /* ===================== HANDOFFS (To Claude Code) ===================== */
 /* The cockpit dispatches real work to Claude Code and tracks it. Each handoff
    carries a payload you can copy as a clean markdown brief and paste straight in. */
-const HANDOFF_STATUS = { new: 'lead', in_progress: 'in_progress', done: 'completed' }
+// handoff status pill classes come from the canonical PILL map
 const HANDOFF_STATUS_LABEL = { new: 'New', in_progress: 'In progress', done: 'Done' }
 const HANDOFF_KIND_LABEL = { gate_step: 'Gate step', task: 'Task', build: 'Build', fix: 'Fix', research: 'Research' }
 
@@ -2276,7 +2315,7 @@ function handoffRow(h) {
     <div class="grow">
       <div class="nm">${esc(h.title || 'Handoff')}</div>
       <div class="qmeta">
-        <span class="pill ${HANDOFF_STATUS[h.status] || 'lead'}"><span class="dot"></span>${esc(HANDOFF_STATUS_LABEL[h.status] || h.status)}</span>
+        <span class="pill ${PILL[h.status] || 'lead'}"><span class="dot"></span>${esc(HANDOFF_STATUS_LABEL[h.status] || h.status)}</span>
         ${h.kind ? `<span class="age-tag">${esc(HANDOFF_KIND_LABEL[h.kind] || h.kind)}</span>` : ''}
         <span class="ct-when">${ago(h.created_at)} ago${done && h.done_at ? ` · shipped ${ago(h.done_at)} ago` : ''}</span>
       </div>
