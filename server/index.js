@@ -2053,7 +2053,23 @@ app.patch('/api/opportunities/:id', auth, async (c) => {
   const r = await q(`update opportunities set ${sets.join(', ')} where id=$${vals.length - 1} and business_id=$${vals.length} returning id, title`, vals)
   if (!r.rowCount) return c.json({ error: 'not found' }, 404)
   if (d.status) { try { await q(`insert into activity (business_id,type,body) values ($1,'scout',$2)`, [b, `Opportunity → ${d.status}: ${(r.rows[0].title || '').slice(0, 70)}`]) } catch (e) {} }
-  return c.json({ ok: true })
+  // Won → auto-create a source='scout' job so Scout revenue shows up in Numbers/Money (closes the loop).
+  let job_id = null
+  if (d.status === 'won') {
+    try {
+      const o = (await q(`select title, link, subreddit, job_id from opportunities where id=$1 and business_id=$2`, [id, b])).rows[0]
+      if (o && !o.job_id) {
+        const cust = (await q(`insert into customers (business_id,name,source) values ($1,$2,'scout') returning id`, [b, `Reddit lead — r/${o.subreddit || 'scout'}`])).rows[0]
+        const issue = `${(o.title || 'Reddit lead').slice(0, 180)}${o.link ? ' — ' + o.link : ''}`
+        const tier = tierOf(issue, null)
+        const job = (await q(`insert into jobs (business_id,customer_id,status,issue,is_high_ticket,ticket_tier,source) values ($1,$2,'lead',$3,$4,$5,'scout') returning id`, [b, cust.id, issue, tier === 'HIGH', tier])).rows[0]
+        await q(`update opportunities set job_id=$1 where id=$2 and business_id=$3`, [job.id, id, b])
+        await q(`insert into activity (business_id,job_id,type,body) values ($1,$2,'system','Won from Lead Scout (Reddit) — fill in contact + quote')`, [b, job.id])
+        job_id = job.id
+      } else if (o) job_id = o.job_id
+    } catch (e) { console.error('[opps] won-convert', e.message) }
+  }
+  return c.json({ ok: true, job_id })
 })
 
 // POST /api/opportunities/:id/regenerate — redraft the reply via the worker, persist it.

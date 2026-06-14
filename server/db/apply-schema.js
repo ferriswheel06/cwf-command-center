@@ -243,6 +243,7 @@ const MIGRATIONS = [
      updated_at  timestamptz not null default now())`,
   `create unique index if not exists opportunities_business_ext_uq on opportunities (business_id, external_id)`,
   `create index if not exists opportunities_business_status_idx on opportunities (business_id, status, score desc)`,
+  `alter table opportunities add column if not exists job_id bigint references jobs(id) on delete set null`,
 ]
 
 export async function applySchema() {
