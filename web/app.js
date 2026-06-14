@@ -43,11 +43,13 @@ const PILL = {
   idea: 'lead', raw: 'lead', editing: 'in_progress', ready: 'completed', posted: 'completed',
   // playbook / handoff
   todo: 'lead', doing: 'in_progress', done: 'completed', new: 'lead',
+  // opportunity pipeline (Lead Scout)
+  replied: 'quoted', engaged: 'in_progress', won: 'paid', dismissed: 'lost',
 }
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
 // 9 rail items in 3 groups. Everything else lives behind the "More" overflow.
 const NAV_GROUPS = [
-  ['Day', [['pulse', 'Pulse', I.spark], ['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today]]],
+  ['Day', [['pulse', 'Pulse', I.spark], ['opportunities', 'Leads', I.bolt], ['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today]]],
   ['Grow', [['quotes', 'Quotes', I.money], ['customers', 'Customers', I.users], ['numbers', 'Numbers', I.numbers], ['content', 'Studio', I.spark]]],
   ['Turn it on', [['activation', 'Activation', I.bolt], ['vault', 'Vault', I.vault]]],
 ]
@@ -63,6 +65,7 @@ const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
 const TITLE = {
   pulse: 'Pulse', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers',
   numbers: 'Numbers', content: 'Studio', activation: 'Activation', vault: 'Vault',
+  opportunities: 'Opportunities',
   handoffs: 'To Claude Code', proof: 'Proof', templates: 'Templates', backburner: 'Back-burner', attention: 'Brief settings',
   // old keys kept mapped so deep-links / setView calls never render undefined
   triage: 'Pipeline', money: 'Numbers', field: 'Numbers', assets: 'Vault', today: 'Pulse', studio: 'Studio',
@@ -125,6 +128,7 @@ const VIEWS = {
   content: viewContent, studio: viewContent, activation: viewActivation, vault: viewVault,
   handoffs: viewHandoffs, templates: viewTemplates, backburner: viewBackburner, proof: viewProof,
   attention: viewAttention,
+  opportunities: viewOpportunities,
   // aliases — never let a stale key hit a dead route
   field: viewNumbers, money: viewNumbers, triage: viewPipeline, assets: viewVault, today: viewPulse,
 }
@@ -2730,6 +2734,126 @@ function probeDuration(file) {
     v.onerror = () => { URL.revokeObjectURL(url); reject(new Error('probe')) }
     v.src = url
   })
+}
+
+/* ===================== OPPORTUNITIES (Lead Scout board) ===================== */
+let _oppFilter = 'New'
+const OPP_FILTERS = [
+  ['All', '', (cn) => cn.all],
+  ['New', 'status=new', (cn) => cn.new],
+  ['High-ticket', 'tag=HIGH-TICKET', (cn) => cn.high_ticket],
+  ['Has-quote', 'tag=HAS QUOTE', (cn) => cn.has_quote],
+  ['Wants-mechanic', 'tag=WANTS MECHANIC', (cn) => cn.wants_mechanic],
+  ['Dismissed', 'status=dismissed', (cn) => cn.dismissed],
+]
+const OPP_NEXT = { new: 'replied', replied: 'engaged', engaged: 'won' }
+const OPP_NEXT_LABEL = { new: 'Mark replied', replied: 'Mark engaged', engaged: 'Mark won' }
+const OPP_TAG_CLASS = { 'HIGH-TICKET': 'ht', 'HAS QUOTE': 'hq', 'URGENT': 'ug', 'WANTS MECHANIC': 'wm', 'GTA': 'gta' }
+
+async function viewOpportunities() {
+  const f = OPP_FILTERS.find(([l]) => l === _oppFilter) || OPP_FILTERS[1]
+  const d = await api('/api/opportunities' + (f[1] ? '?' + f[1] : ''))
+  const items = d.opportunities || []
+  const cn = d.counts || {}
+  const hot = items.filter((o) => o.status === 'new' && (o.tags || []).includes('HIGH-TICKET')).length
+
+  setView(`
+    <div class="brief"><span class="tag">${I.bolt} Money in the pipe</span>
+      <p>Lead Scout watches Reddit for GTA drivers holding a scary shop quote or hunting a mechanic they can trust. The hottest land up top — reply in your own voice, win the job. No price is ever quoted.</p></div>
+
+    <div class="kpis opp-kpis">
+      <div class="kpi primary"><div class="lab">Live leads</div><div class="val">${cn.all || 0}</div><div class="meta">to work</div></div>
+      <div class="kpi ${hot ? 'warn' : ''}"><div class="lab">Hot &amp; new</div><div class="val">${hot}</div><div class="meta">high-ticket, untouched</div></div>
+      <div class="kpi"><div class="lab">Replied</div><div class="val">${cn.replied || 0}</div><div class="meta">in play</div></div>
+      <div class="kpi"><div class="lab">Won</div><div class="val">${cn.won || 0}</div><div class="meta">from Scout</div></div>
+    </div>
+
+    <div class="lib-bar">
+      <div class="lib-chips">
+        ${OPP_FILTERS.map(([l, , ct]) => `<button class="lib-chip ${l === _oppFilter ? 'on' : ''}" data-of2="${l}">${l} <b>${ct(cn) || 0}</b></button>`).join('')}
+      </div>
+      <button class="btn ghost sm" id="opp-refresh">${I.spark} Refresh</button>
+    </div>
+
+    <div class="sec-h"><span class="label">${_oppFilter} opportunities</span><span class="ct">${items.length}</span></div>
+    ${items.length
+      ? `<div class="list opp-list">${items.map(oppCard).join('')}</div>`
+      : emptyState('No leads here yet',
+          _oppFilter === 'New'
+            ? 'Scout sweeps Reddit every 30 minutes. The moment a GTA quote-check or "need a trustworthy mechanic" post lands, it shows up here — ranked, with a reply already drafted. Tap Refresh to pull the latest.'
+            : 'Nothing in this filter right now. Try All, or tap Refresh to pull the latest sweep.')}
+  `)
+
+  app.querySelectorAll('[data-of2]').forEach((b) => (b.onclick = () => { _oppFilter = b.dataset.of2; renderApp('opportunities') }))
+  const rb = $('#opp-refresh'); if (rb) rb.onclick = oppRefresh
+  items.forEach((o) => bindOppCard(o))
+}
+
+function oppCard(o) {
+  const tags = o.tags || []
+  const next = OPP_NEXT[o.status]
+  return `<div class="lrow qrow opp-row" data-opp="${o.id}">
+    <div class="grow">
+      <div class="nm">${esc(o.title || 'Reddit lead')}</div>
+      <div class="qmeta">
+        <span class="pill ${PILL[o.status] || 'lead'}"><span class="dot"></span>${esc(o.status)}</span>
+        ${Number(o.score) ? `<span class="ai-score${Number(o.score) >= 6 ? ' high' : ''}">${I.spark}${Number(o.score)}</span>` : ''}
+        ${tags.map((t) => `<span class="opp-tag ${OPP_TAG_CLASS[t] || ''}">${esc(t)}</span>`).join('')}
+        <span class="age-tag">${ago(o.posted_at || o.created_at)}</span>
+        ${o.subreddit ? `<span class="sub">r/${esc(o.subreddit)}</span>` : ''}
+      </div>
+      <div class="opp-draft-wrap">
+        <div class="mini-h">${I.spark} Drafted reply <span class="opp-draft-note">trust-led · no price quoted</span></div>
+        <textarea class="input ta opp-draft" id="oppdr-${o.id}" rows="5">${esc(o.ai_draft || '')}</textarea>
+        <div class="opp-draft-acts">
+          <button class="btn primary sm" data-opp-copy="${o.id}">${I.check} Copy reply</button>
+          <button class="btn ai sm" data-opp-regen="${o.id}">${I.spark} Regenerate</button>
+          <button class="btn ghost sm" data-opp-save="${o.id}">Save edit</button>
+        </div>
+      </div>
+    </div>
+    <div class="qright opp-right">
+      ${o.link ? `<a class="btn ghost sm" href="${esc(o.link)}" target="_blank" rel="noopener">${I.arrow} Open on Reddit</a>` : ''}
+      ${next ? `<button class="btn primary sm" data-opp-adv="${o.id}" data-to="${next}">${OPP_NEXT_LABEL[o.status]}</button>` : ''}
+      ${o.status !== 'won' && o.status !== 'dismissed' ? `<button class="btn ghost sm" data-opp-win="${o.id}">Mark won</button>` : ''}
+      ${o.status !== 'dismissed' ? `<button class="btn ghost sm danger" data-opp-dismiss="${o.id}">Dismiss</button>` : `<button class="btn ghost sm" data-opp-restore="${o.id}">Restore</button>`}
+    </div>
+  </div>`
+}
+
+function bindOppCard(o) {
+  const row = $(`.opp-row[data-opp="${o.id}"]`)
+  if (!row) return
+  const cp = $(`[data-opp-copy="${o.id}"]`, row)
+  if (cp) cp.onclick = () => copyText($(`#oppdr-${o.id}`, row).value, cp)
+  const rg = $(`[data-opp-regen="${o.id}"]`, row)
+  if (rg) rg.onclick = async () => {
+    rg.disabled = true; const prev = rg.innerHTML; rg.textContent = 'Drafting…'
+    const r = await api(`/api/opportunities/${o.id}/regenerate`, { method: 'POST', body: JSON.stringify({}) })
+    if (r && r.draft) { $(`#oppdr-${o.id}`, row).value = r.draft; toast('Fresh draft ready') }
+    rg.disabled = false; rg.innerHTML = prev
+  }
+  const sv = $(`[data-opp-save="${o.id}"]`, row)
+  if (sv) sv.onclick = async () => { await api(`/api/opportunities/${o.id}`, { method: 'PATCH', body: JSON.stringify({ ai_draft: $(`#oppdr-${o.id}`, row).value }) }); toast('Saved') }
+  const adv = $(`[data-opp-adv="${o.id}"]`, row); if (adv) adv.onclick = () => oppSetStatus(o.id, adv.dataset.to, row)
+  const win = $(`[data-opp-win="${o.id}"]`, row); if (win) win.onclick = () => oppSetStatus(o.id, 'won', row)
+  const dis = $(`[data-opp-dismiss="${o.id}"]`, row); if (dis) dis.onclick = () => oppSetStatus(o.id, 'dismissed', row, true)
+  const res = $(`[data-opp-restore="${o.id}"]`, row); if (res) res.onclick = () => oppSetStatus(o.id, 'new', row)
+}
+
+async function oppSetStatus(id, to, row, leaving) {
+  const removes = leaving || (_oppFilter === 'New' && to !== 'new') || (_oppFilter === 'Dismissed' && to !== 'dismissed')
+  if (removes && row) { row.classList.add('opp-leaving'); setTimeout(() => row.remove(), 200) }
+  await api(`/api/opportunities/${id}`, { method: 'PATCH', body: JSON.stringify({ status: to }) })
+  toast(to === 'won' ? '🏆 Won from Scout — log the job in Pipeline' : `Moved to ${to}`)
+  renderApp('opportunities')
+}
+
+async function oppRefresh() {
+  const btn = $('#opp-refresh'); if (btn) { btn.disabled = true; btn.textContent = 'Pulling…' }
+  const r = await api('/api/opportunities/refresh', { method: 'POST' })
+  if (r && r.ok) toast(r.fresh ? `${r.fresh} new lead${r.fresh > 1 ? 's' : ''}` : 'Up to date')
+  renderApp('opportunities')
 }
 
 if (token) renderApp('pulse'); else renderLogin()

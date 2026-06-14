@@ -13,6 +13,7 @@ import {
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { applySchema } from './db/apply-schema.js'
+import cron from 'node-cron'
 
 const { Pool } = pg
 const pool = new Pool({
@@ -1944,9 +1945,150 @@ app.get('/api/funnel', auth, async (c) => {
   })
 })
 
+// ===================== LEAD SCOUT → OPPORTUNITIES =====================
+// Reddit intercepts (scored + AI-drafted in the crm-api Worker) become a worked pipeline here.
+// The Worker owns the 30-min scan + the free AI; this server pulls the persisted hits
+// service-to-service (X-Scout-Key) and tracks Fares' worked state in Postgres.
+const SCOUT_FEED_URL  = process.env.SCOUT_FEED_URL  || 'https://api.carswithfares.ca/scout/hits'
+const SCOUT_DRAFT_URL = process.env.SCOUT_DRAFT_URL || 'https://api.carswithfares.ca/scout/draft-test'
+const SCOUT_FEED_KEY  = process.env.SCOUT_FEED_KEY  || ''
+
+async function scoutFetch(url, opts = {}, ms = 12000) {
+  try {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), ms)
+    const res = await fetch(url, {
+      ...opts,
+      headers: { 'content-type': 'application/json', 'X-Scout-Key': SCOUT_FEED_KEY, ...(opts.headers || {}) },
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(t))
+    if (!res.ok) { console.error('[scout] fetch', url, res.status); return null }
+    return await res.json().catch(() => null)
+  } catch (e) { console.error('[scout]', e.message); return null }
+}
+
+// Pull the worker's persisted hits and upsert into opportunities. Dedupe by external_id;
+// NEVER overwrite Fares' worked state (status/notes). Defensive per-row so one bad row or a
+// missing table never aborts the batch. Returns counts for the refresh button.
+async function syncOpportunities(b = 1) {
+  const j = await scoutFetch(SCOUT_FEED_URL)
+  const hits = j && Array.isArray(j.hits) ? j.hits : []
+  let upserted = 0, fresh = 0
+  for (const h of hits) {
+    const ext = (h.id || '').toString().trim()
+    if (!ext) continue
+    const tags = Array.isArray(h.tags) ? h.tags : []
+    let r
+    try {
+      r = await q(
+        `insert into opportunities
+           (business_id, source, external_id, subreddit, link, title, score, tags, ai_draft, posted_at, status)
+         values ($1,'scout',$2,$3,$4,$5,$6,$7::jsonb,$8,$9,'new')
+         on conflict (business_id, external_id) do update set
+           subreddit = excluded.subreddit, link = excluded.link, title = excluded.title,
+           score = excluded.score, tags = excluded.tags,
+           ai_draft = coalesce(opportunities.ai_draft, excluded.ai_draft),
+           updated_at = now()
+         returning (xmax = 0) as inserted`,
+        [b, ext, h.subreddit || null, h.link || null, h.title || null,
+         Number(h.score) || 0, JSON.stringify(tags), h.draft || null,
+         h.created_utc ? new Date(h.created_utc * 1000).toISOString() : null]
+      )
+    } catch (e) { console.error('[scout] upsert', e.message); continue }
+    upserted++
+    if (r.rows[0] && r.rows[0].inserted) {
+      fresh++
+      try { await q(`insert into activity (business_id,type,body) values ($1,'scout',$2)`, [b, `New opportunity: ${(h.title || 'Reddit lead').slice(0, 80)}`]) } catch (e) {}
+    }
+  }
+  return { fetched: hits.length, upserted, fresh }
+}
+
+// GET /api/opportunities — ranked board (worked-stage, then score, then recency), filterable, with live counts.
+app.get('/api/opportunities', auth, async (c) => {
+  const b = biz(c)
+  const status = (c.req.query('status') || '').toString().trim()
+  const tag = (c.req.query('tag') || '').toString().trim()
+  const params = [b]
+  let where = `o.business_id=$1 and o.status <> 'dismissed'`
+  if (status === 'dismissed') where = `o.business_id=$1 and o.status='dismissed'`
+  else if (status) { params.push(status); where += ` and o.status=$${params.length}` }
+  if (tag) { params.push(tag); where += ` and o.tags ? $${params.length}` }
+  try {
+    const rows = (await q(
+      `select o.id, o.source, o.external_id, o.subreddit, o.link, o.title, o.score, o.tags,
+              o.ai_draft, o.status, o.notes, o.posted_at, o.created_at, o.updated_at
+       from opportunities o where ${where}
+       order by case o.status when 'new' then 0 when 'replied' then 1 when 'engaged' then 2 when 'won' then 3 else 4 end,
+                o.score desc nulls last, coalesce(o.posted_at, o.created_at) desc`, params)).rows
+    const counts = (await q(
+      `select
+         count(*) filter (where status <> 'dismissed')::int as all,
+         count(*) filter (where status='new')::int as new,
+         count(*) filter (where status='replied')::int as replied,
+         count(*) filter (where status='engaged')::int as engaged,
+         count(*) filter (where status='won')::int as won,
+         count(*) filter (where status='dismissed')::int as dismissed,
+         count(*) filter (where status <> 'dismissed' and tags ? 'HIGH-TICKET')::int as high_ticket,
+         count(*) filter (where status <> 'dismissed' and tags ? 'HAS QUOTE')::int as has_quote,
+         count(*) filter (where status <> 'dismissed' and tags ? 'WANTS MECHANIC')::int as wants_mechanic
+       from opportunities where business_id=$1`, [b])).rows[0]
+    return c.json({ opportunities: rows, counts })
+  } catch (e) { console.error('[opps] list', e.message); return c.json({ opportunities: [], counts: {} }) }
+})
+
+// PATCH /api/opportunities/:id — worked state (status / notes / edited draft).
+app.patch('/api/opportunities/:id', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c), d = await c.req.json().catch(() => ({}))
+  const ALLOWED = ['new', 'replied', 'engaged', 'won', 'dismissed']
+  const sets = [], vals = []
+  if (d.status !== undefined) {
+    if (!ALLOWED.includes(d.status)) return c.json({ error: 'bad status' }, 400)
+    vals.push(d.status); sets.push(`status=$${vals.length}`)
+  }
+  for (const k of ['notes', 'ai_draft']) if (d[k] !== undefined) { vals.push(d[k]); sets.push(`${k}=$${vals.length}`) }
+  if (!sets.length) return c.json({ error: 'nothing to update' }, 400)
+  sets.push(`updated_at=now()`)
+  vals.push(id, b)
+  const r = await q(`update opportunities set ${sets.join(', ')} where id=$${vals.length - 1} and business_id=$${vals.length} returning id, title`, vals)
+  if (!r.rowCount) return c.json({ error: 'not found' }, 404)
+  if (d.status) { try { await q(`insert into activity (business_id,type,body) values ($1,'scout',$2)`, [b, `Opportunity → ${d.status}: ${(r.rows[0].title || '').slice(0, 70)}`]) } catch (e) {} }
+  return c.json({ ok: true })
+})
+
+// POST /api/opportunities/:id/regenerate — redraft the reply via the worker, persist it.
+app.post('/api/opportunities/:id/regenerate', auth, async (c) => {
+  const id = c.req.param('id'), b = biz(c)
+  const o = (await q(`select title, subreddit, ai_draft from opportunities where id=$1 and business_id=$2`, [id, b])).rows[0]
+  if (!o) return c.json({ error: 'not found' }, 404)
+  const body = await c.req.json().catch(() => ({}))
+  const j = await scoutFetch(SCOUT_DRAFT_URL, { method: 'POST', body: JSON.stringify({ title: o.title || '', selftext: body.selftext || '', subreddit: o.subreddit || '' }) })
+  const draft = j && typeof j.draft === 'string' ? j.draft.trim() : ''
+  if (!draft) return c.json({ error: 'draft service unavailable' }, 502)
+  await q(`update opportunities set ai_draft=$1, updated_at=now() where id=$2 and business_id=$3`, [draft, id, b])
+  return c.json({ ok: true, draft })
+})
+
+// POST /api/opportunities/refresh — pull fresh intercepts from Scout right now.
+app.post('/api/opportunities/refresh', auth, async (c) => {
+  const r = await syncOpportunities(biz(c))
+  return c.json({ ok: true, ...r })
+})
+// =====================================================================
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
 
 const port = Number(process.env.PORT) || 3000
 serve({ fetch: app.fetch, port }, (i) => console.log(`command-center listening on :${i.port}`))
+
+// ---- Lead Scout poll: pull new intercepts every 15 min (the worker scans Reddit every 30) ----
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const r = await syncOpportunities(1)
+    if (r.fresh) console.log(`[cron scout] +${r.fresh} new (${r.upserted} upserted)`)
+  } catch (e) { console.error('[cron scout]', e.message) }
+}, { timezone: 'America/Toronto' })
+// warm pull a few seconds after boot so the board isn't empty on a cold start
+setTimeout(() => { syncOpportunities(1).catch(() => {}) }, 8000)
