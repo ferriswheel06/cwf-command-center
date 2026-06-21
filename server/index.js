@@ -2092,6 +2092,103 @@ app.post('/api/opportunities/refresh', auth, async (c) => {
 })
 // =====================================================================
 
+// ===================== INBOUND LEADS BRIDGE =====================
+// The public website quote/contact form POSTs to the crm-api Worker's /leads/intake, which writes
+// to Cloudflare D1 + fires the instant Telegram/SMS alert. This cockpit lives on its own Postgres
+// and never saw those leads — that's why "messages from the website" weren't showing up here.
+// syncLeads() pulls the worker's keyed /leads/feed (same X-Scout-Key bridge as Lead Scout) and
+// mirrors each lead into Postgres so it lands in the Leads inbox + Pipeline + Pulse.
+const LEADS_FEED_URL = process.env.LEADS_FEED_URL || 'https://api.carswithfares.ca/leads/feed'
+// Map the D1 status vocabulary into the cockpit job_status enum (defensive: anything odd → 'lead').
+const LEAD_STATUS_MAP = { lead: 'lead', new: 'lead', quoted: 'quoted', booked: 'scheduled', scheduled: 'scheduled', in_progress: 'in_progress', done: 'completed', completed: 'completed', paid: 'paid', lost: 'lost' }
+
+let _leadSyncRunning = false
+async function syncLeads(b = 1) {
+  // Single Railway instance → an in-process guard fully prevents the 3-min cron and the manual
+  // "Sync from site" button from running syncLeads at the same time (a concurrent race could
+  // otherwise leak an orphan customer/vehicle for a phoneless lead — both runs miss the
+  // external_id check, both create the customer, only one job wins the unique index).
+  if (_leadSyncRunning) return { fetched: 0, fresh: 0, seen: 0, busy: true }
+  _leadSyncRunning = true
+  try {
+    const j = await scoutFetch(LEADS_FEED_URL)
+    const leads = j && Array.isArray(j.leads) ? j.leads : []
+    if (leads.length >= 500) console.warn('[leads] feed returned 500 rows — likely truncated; raise the feed LIMIT or page it')
+    let fresh = 0, seen = 0
+    for (const L of leads) {
+      const ext = L.id != null ? `d1:${L.id}` : null
+      if (!ext) continue
+      try {
+        // Already mirrored once? Skip — NEVER touch Fares' worked state (status/quote/notes).
+        // Keyed on external_id only: if a job-delete UI is ever added, a deleted-but-still-open-in-D1
+        // lead would be re-created by the next sync until a tombstone (dismissed external_ids) exists.
+        const existing = (await q(`select id from jobs where business_id=$1 and external_id=$2`, [b, ext])).rows[0]
+        if (existing) { seen++; continue }
+
+        // --- clean the message + lift structured bits. City/service form pages prepend
+        //     "Service requested: <svc>" and/or "Looking in: <city>" lines before the typed message
+        //     (see f3rss-site/quote-widget.js) — strip both in any order, message optional; lift
+        //     city→location, service→service. D1 jobs.location usually already carries the city. ---
+        let issue = (L.issue || '').toString().trim()
+        let loc = L.city || L.location || null
+        let svc = null
+        for (let i = 0; i < 3; i++) {
+          let m = issue.match(/^Service requested:\s*(.+?)(?:\r?\n+|$)([\s\S]*)$/i)
+          if (m) { if (!svc) svc = m[1].trim(); issue = m[2]; continue }
+          m = issue.match(/^Looking in:\s*(.+?)(?:\r?\n+|$)([\s\S]*)$/i)
+          if (m) { if (!loc) loc = m[1].trim(); issue = m[2]; continue }
+          break
+        }
+        issue = issue.trim()
+
+        // --- customer: dedupe by normalized phone (last 10 digits), else create ---
+        const norm = L.phone ? String(L.phone).replace(/\D/g, '').slice(-10) : null
+        let cust = norm ? (await q(`select id from customers where business_id=$1 and phone_normalized=$2`, [b, norm])).rows[0] : null
+        if (!cust) {
+          cust = (await q(`insert into customers (business_id,name,phone,phone_normalized,email,location,source)
+            values ($1,$2,$3,$4,$5,$6,$7) returning id`,
+            [b, (L.name || 'Website lead').toString().slice(0, 200), L.phone || null, norm, L.email || null, loc, L.source || 'website'])).rows[0]
+        }
+
+        // --- vehicle: attach if the lead carries one (fresh job only, so no dup vehicles on re-sync) ---
+        let vId = null
+        const yr = L.vehicle_year ? Number(L.vehicle_year) : null
+        if (yr || L.vehicle_make || L.vehicle_model) {
+          const vstr = [L.vehicle_make, L.vehicle_model].filter(Boolean).join(' ')
+          const isEuro = /bmw|audi|mercedes|benz|volkswagen|\bvw\b|mini|porsche|volvo|jaguar|land.?rover/i.test(vstr)
+          vId = (await q(`insert into vehicles (business_id,customer_id,year,make,model,is_euro)
+            values ($1,$2,$3,$4,$5,$6) returning id`,
+            [b, cust.id, yr, L.vehicle_make || null, L.vehicle_model || null, isEuro])).rows[0].id
+        }
+
+        // --- job: status, service, AI tier/safety heuristics, preserve the original inbound time ---
+        const status = LEAD_STATUS_MAP[(L.status || 'lead').toString()] || 'lead'
+        const tier = tierOf(issue, null), safety = safetyOf(issue)
+        const createdAt = L.created_at ? new Date(String(L.created_at).replace(' ', 'T') + 'Z') : null
+        const createdIso = createdAt && !isNaN(createdAt) ? createdAt.toISOString() : null
+        const job = (await q(
+          `insert into jobs (business_id,customer_id,vehicle_id,external_id,status,issue,service,source,is_high_ticket,ticket_tier,safety_flag,created_at)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, coalesce($12::timestamptz, now())) returning id`,
+          [b, cust.id, vId, ext, status, issue || null, svc, L.source || 'website', tier === 'HIGH', tier, safety, createdIso]
+        )).rows[0]
+        fresh++
+        try {
+          await q(`insert into activity (business_id,job_id,customer_id,type,body) values ($1,$2,$3,'system',$4)`,
+            [b, job.id, cust.id, `New website lead — ${(L.name || 'Unknown')}${issue ? ': ' + issue.slice(0, 90) : ''}`])
+        } catch (e) {}
+      } catch (e) { console.error('[leads] sync row', e.message); continue }
+    }
+    return { fetched: leads.length, fresh, seen }
+  } finally { _leadSyncRunning = false }
+}
+
+// POST /api/leads/sync — pull inbound website leads from the site right now (Leads inbox refresh button).
+app.post('/api/leads/sync', auth, async (c) => {
+  const r = await syncLeads(biz(c))
+  return c.json({ ok: true, ...r })
+})
+// =====================================================================
+
 // ---- boot ----
 await applySchema().catch((e) => console.error('schema bootstrap error:', e))
 await seedIfEmpty()
@@ -2108,3 +2205,14 @@ cron.schedule('*/15 * * * *', async () => {
 }, { timezone: 'America/Toronto' })
 // warm pull a few seconds after boot so the board isn't empty on a cold start
 setTimeout(() => { syncOpportunities(1).catch(() => {}) }, 8000)
+
+// ---- Inbound leads poll: pull website/phone leads from the crm-api D1 every 3 min ----
+// (The instant alert already fires via Telegram on intake; this keeps the cockpit board current.)
+cron.schedule('*/3 * * * *', async () => {
+  try {
+    const r = await syncLeads(1)
+    if (r.fresh) console.log(`[cron leads] +${r.fresh} new website lead(s) (${r.seen} already synced)`)
+  } catch (e) { console.error('[cron leads]', e.message) }
+}, { timezone: 'America/Toronto' })
+// warm pull shortly after boot so the 18 stranded leads land immediately on first deploy
+setTimeout(() => { syncLeads(1).then((r) => r && r.fresh && console.log(`[boot leads] +${r.fresh} synced`)).catch(() => {}) }, 12000)

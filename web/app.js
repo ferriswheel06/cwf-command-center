@@ -49,12 +49,13 @@ const PILL = {
 const STATUS_COLOR = { lead: 'var(--fg4)', quoted: 'var(--yellow)', scheduled: 'var(--navy)', in_progress: 'var(--accent)', completed: 'var(--green)', paid: 'var(--green)', lost: 'var(--red)' }
 // 9 rail items in 3 groups. Everything else lives behind the "More" overflow.
 const NAV_GROUPS = [
-  ['Day', [['pulse', 'Pulse', I.spark], ['opportunities', 'Leads', I.bolt], ['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today]]],
+  ['Day', [['pulse', 'Pulse', I.spark], ['leads', 'Leads', I.bolt], ['pipeline', 'Pipeline', I.pipeline], ['calendar', 'Calendar', I.today]]],
   ['Grow', [['quotes', 'Quotes', I.money], ['customers', 'Customers', I.users], ['numbers', 'Numbers', I.numbers], ['content', 'Studio', I.spark]]],
   ['Turn it on', [['activation', 'Activation', I.bolt], ['vault', 'Vault', I.vault]]],
 ]
 // The overflow drawer — config + low-frequency surfaces, off the permanent rail.
 const NAV_OVERFLOW = [
+  ['opportunities', 'Radar', I.spark],
   ['handoffs', 'To Claude Code', I.spark],
   ['proof', 'Proof', I.check],
   ['templates', 'Templates', I.arrow],
@@ -63,9 +64,9 @@ const NAV_OVERFLOW = [
 ]
 const FLAT = NAV_GROUPS.flatMap(([, items]) => items)
 const TITLE = {
-  pulse: 'Pulse', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers',
+  pulse: 'Pulse', leads: 'Leads', pipeline: 'Pipeline', calendar: 'Calendar', quotes: 'Quotes', customers: 'Customers',
   numbers: 'Numbers', content: 'Studio', activation: 'Activation', vault: 'Vault',
-  opportunities: 'Opportunities',
+  opportunities: 'Radar',
   handoffs: 'To Claude Code', proof: 'Proof', templates: 'Templates', backburner: 'Back-burner', attention: 'Brief settings',
   // old keys kept mapped so deep-links / setView calls never render undefined
   triage: 'Pipeline', money: 'Numbers', field: 'Numbers', assets: 'Vault', today: 'Pulse', studio: 'Studio',
@@ -123,7 +124,7 @@ async function renderApp(next) {
 // One router map replaces the if/else chain. Aliases keep old keys / deep-links alive:
 // field+money fold into Numbers, triage into Pipeline, assets into Vault, today into Pulse.
 const VIEWS = {
-  pulse: viewPulse, pipeline: viewPipeline, calendar: viewCalendar,
+  pulse: viewPulse, leads: viewLeads, pipeline: viewPipeline, calendar: viewCalendar,
   quotes: viewQuotes, customers: viewCustomers, numbers: viewNumbers,
   content: viewContent, studio: viewContent, activation: viewActivation, vault: viewVault,
   handoffs: viewHandoffs, templates: viewTemplates, backburner: viewBackburner, proof: viewProof,
@@ -328,6 +329,44 @@ function moneyFirstSort(jobs) {
     (b.ticket_tier === 'HIGH') - (a.ticket_tier === 'HIGH') ||
     (b.safety_flag ? 1 : 0) - (a.safety_flag ? 1 : 0) ||
     new Date(b.created_at) - new Date(a.created_at))
+}
+/* ---------------- LEADS (the inbound inbox — people who messaged us from the site) ---------------- */
+// THE "where are my messages" screen. The website quote/contact form writes to the crm-api D1;
+// syncLeads() on the server mirrors them into Postgres on a 3-min cron (+ this view's manual sync).
+// Newest + money-first, one-tap call/reply/open. Reuses triageRow + bindTriage.
+async function viewLeads() {
+  const tr = $('.topbar .right')
+  if (tr) tr.innerHTML = `<button class="btn ghost sm" id="lead-sync">${I.arrow} Sync from site</button><button class="btn primary sm" id="addlead">${I.plus} Add lead</button>`
+  const al = $('#addlead'); if (al) al.onclick = openAddLead
+  const sync = $('#lead-sync')
+  if (sync) sync.onclick = async () => {
+    const orig = sync.innerHTML; sync.disabled = true; sync.innerHTML = 'Syncing…'
+    try {
+      const r = await api('/api/leads/sync', { method: 'POST' })
+      if (typeof toast === 'function') toast(r && r.fresh ? `${r.fresh} new lead${r.fresh === 1 ? '' : 's'} pulled in` : 'Up to date — no new leads', r && r.fresh ? 'good' : '')
+      renderApp('leads')
+    } finally { sync.disabled = false; sync.innerHTML = orig }
+  }
+  const d = await api('/api/jobs'); const jobs = d.jobs || []
+  const inbound = jobs.filter((j) => j.status === 'lead' || j.status === 'quoted')
+  const ranked = moneyFirstSort(inbound)
+  const uncontacted = ranked.filter((j) => !j.first_contact_at).length
+  const high = inbound.filter((j) => j.ticket_tier === 'HIGH').length
+  const dayAgo = Date.now() - 86400000, weekAgo = Date.now() - 7 * 86400000
+  const todayN = inbound.filter((j) => new Date(j.created_at).getTime() >= dayAgo).length
+  const weekN = inbound.filter((j) => new Date(j.created_at).getTime() >= weekAgo).length
+  setView(`
+    <div class="kpis">
+      <div class="kpi primary"><div class="lab">New · untouched</div><div class="val">${uncontacted}</div><div class="meta">no reply yet</div></div>
+      <div class="kpi ${high ? 'warn' : ''}"><div class="lab">High-ticket</div><div class="val">${high}</div><div class="meta">work these first</div></div>
+      <div class="kpi"><div class="lab">Today</div><div class="val">${todayN}</div><div class="meta">came in</div></div>
+      <div class="kpi"><div class="lab">This week</div><div class="val">${weekN}</div><div class="meta">last 7 days</div></div>
+    </div>
+    <div class="sec-h"><span class="label">Inbound · newest, money first</span><span class="ct">${ranked.length}</span></div>
+    ${ranked.length ? `<div class="list">${ranked.map(triageRow).join('')}</div>`
+      : emptyState('No leads in yet', 'Every quote/contact form on carswithfares.ca lands right here — name, vehicle, what they need, one tap to call. New ones also ping your Telegram instantly. Hit “Sync from site” to pull the latest now.')}
+  `)
+  bindTriage(ranked)
 }
 async function viewPipeline() {
   const d = await api('/api/jobs'); const jobs = d.jobs || []

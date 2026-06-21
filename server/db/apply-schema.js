@@ -244,6 +244,14 @@ const MIGRATIONS = [
   `create unique index if not exists opportunities_business_ext_uq on opportunities (business_id, external_id)`,
   `create index if not exists opportunities_business_status_idx on opportunities (business_id, status, score desc)`,
   `alter table opportunities add column if not exists job_id bigint references jobs(id) on delete set null`,
+
+  // ---- INBOUND LEADS BRIDGE. The public website quote/contact form writes leads to the crm-api
+  // Cloudflare D1 (that's where /leads/intake lives); this cockpit runs on its own Postgres and
+  // never saw them. syncLeads() pulls the worker's /leads/feed and upserts here. external_id
+  // ('d1:<jobId>') is the dedupe key so re-syncs are idempotent and cockpit-native jobs
+  // (external_id NULL) can never collide with synced ones. Additive + idempotent.
+  `alter table jobs add column if not exists external_id text`,
+  `create unique index if not exists jobs_business_external_uq on jobs (business_id, external_id) where external_id is not null`,
 ]
 
 export async function applySchema() {
